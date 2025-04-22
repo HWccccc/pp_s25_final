@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "xutility": "c",
+        "algorithm": "c",
+        "limits": "c",
+        "utility": "c",
+        "immintrin.h": "c"
+    }
+}
