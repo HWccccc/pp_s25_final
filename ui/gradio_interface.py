@@ -375,14 +375,13 @@ class GradioInterface:
                 with gr.Column(scale=1):
                     with gr.Tabs() as tabs:
                         with gr.Tab("原始影片"):
-                            original_output = gr.Image(label="原始影片")
-
+                            original_output = gr.Image(label="原始影片", streaming=True)
                 with gr.Column(scale=1):
                     with gr.Tabs() as tabs:
                         with gr.Tab("追蹤預測"):
-                            processed_output = gr.Image(label="預測結果")
+                            processed_output = gr.Image(label="預測結果", streaming=True)
                         with gr.Tab("球場視圖"):
-                            court_view = gr.Image(label="球場平面圖")
+                            court_view = gr.Image(label="球場平面圖", streaming=True)
 
             # 添加性能報告文本框
             performance_textbox = gr.Textbox(label="性能報告", lines=10)
