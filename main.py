@@ -1,6 +1,8 @@
 import os
+import sys
 from models.basketball_tracker import BasketballTracker
 from ui.gradio_interface import GradioInterface
+import multiprocessing as mp
 
 def main():
     # 確保數據文件夾存在
@@ -28,4 +30,7 @@ def main():
         print(f"程序運行時發生錯誤: {e}")
 
 if __name__ == "__main__":
+    if sys.platform.startswith('win') or sys.platform.startswith('darwin'):
+        try: mp.set_start_method('spawn', force=True)
+        except RuntimeError: print("警告: MP 'spawn' failed.")
     main()
