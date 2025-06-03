@@ -14,16 +14,83 @@ from .coordinate_mapper import CoordinateMapper
 from utils.data_manager import DataManager
 import time
 from collections import defaultdict
+import multiprocessing as mp
+import sys
+
+# ===== 新增：佇列工作函式 =====
+def player_queue_worker(task_queue, result_queue, player_model_path, device):
+    """球員偵測佇列工作函式"""
+    print("[球員佇列工作進程] 啟動，載入模型中...")
+    model = YOLO(player_model_path).to(device)
+    with torch.no_grad():
+        while True:
+            task = task_queue.get()
+            if task is None:
+                print("[球員佇列工作進程] 收到結束訊號，退出。")
+                break
+            idx, frame = task
+            start = time.time()
+            res = model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+            t = time.time() - start
+            result_queue.put(('player', idx, res, t))
+
+def court_queue_worker(task_queue, result_queue, court_model_path, device):
+    """球場偵測佇列工作函式"""
+    print("[球場佇列工作進程] 啟動，載入模型中...")
+    model = YOLO(court_model_path).to(device)
+    with torch.no_grad():
+        while True:
+            task = task_queue.get()
+            if task is None:
+                print("[球場佇列工作進程] 收到結束訊號，退出。")
+                break
+            idx, frame = task
+            start = time.time()
+            res = model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+            t = time.time() - start
+            result_queue.put(('court', idx, res, t))
 
 class BasketballTracker:
     def __init__(self, player_model_path, court_model_path, data_folder):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"使用設備: {self.device}")
 
-        # 載入模型
-        self.player_model = YOLO(player_model_path).to(self.device)
-        self.court_model = YOLO(court_model_path).to(self.device)
-        print(f"模型載入完成")
+        # 儲存模型路徑（用於多進程）
+        self.player_model_path = player_model_path
+        self.court_model_path = court_model_path
+
+        # ===== 新增：佇列多進程設置 =====
+        # 設定多進程啟動方法
+        if sys.platform in ['win32', 'darwin']:
+            try:
+                mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
+        
+        # 建立佇列和工作進程
+        self.ctx = mp.get_context("spawn")
+        self.player_task_queue = self.ctx.Queue(maxsize=10)
+        self.court_task_queue = self.ctx.Queue(maxsize=10)
+        self.result_queue = self.ctx.Queue()
+        
+        # 啟動工作進程
+        self.player_process = self.ctx.Process(
+            target=player_queue_worker,
+            args=(self.player_task_queue, self.result_queue, player_model_path, self.device)
+        )
+        self.court_process = self.ctx.Process(
+            target=court_queue_worker,
+            args=(self.court_task_queue, self.result_queue, court_model_path, self.device)
+        )
+        self.player_process.daemon = True
+        self.court_process.daemon = True
+        self.player_process.start()
+        self.court_process.start()
+
+        # 移除原本的模型載入（改為在工作進程中載入）
+        # self.player_model = YOLO(player_model_path).to(self.device)
+        # self.court_model = YOLO(court_model_path).to(self.device)
+        print(f"佇列多進程模式已啟動")
 
         import paddle
         print(paddle.is_compiled_with_cuda())  # 如果返回 False，表示 Paddle 未啟用 GPU 支援
@@ -278,6 +345,26 @@ class BasketballTracker:
 
     def release(self):
         """釋放資源"""
+        # ===== 新增：關閉佇列多進程 =====
+        try:
+            # 發送結束訊號
+            self.player_task_queue.put(None)
+            self.court_task_queue.put(None)
+            
+            # 等待進程結束
+            self.player_process.join(timeout=3)
+            self.court_process.join(timeout=3)
+            
+            # 強制終止未結束的進程
+            if self.player_process.is_alive():
+                self.player_process.terminate()
+            if self.court_process.is_alive():
+                self.court_process.terminate()
+                
+            print("佇列多進程已關閉")
+        except Exception as e:
+            print(f"關閉佇列多進程時發生錯誤: {e}")
+
         if self.video_capture is not None:
             self.video_capture.release()
         self.video_capture = None
@@ -348,19 +435,6 @@ class BasketballTracker:
         self.frame_count += 1
         self.total_frames_processed += 1
 
-        # # 添加幀計數顯示
-        # frame_info = f"Current Frame: {self.frame_count}"
-        # cv2.putText(frame, frame_info, (10, 30),
-        #             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        #
-        # # 添加處理延遲顯示
-        # if hasattr(self, 'last_frame_time'):
-        #     processing_time = time.time() - self.last_frame_time
-        #     fps = 1.0 / processing_time if processing_time > 0 else 0
-        #     delay_info = f"FPS: {fps:.2f}"
-        #     cv2.putText(frame, delay_info, (10, 60),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
         self.last_frame_time = time.time()
 
         processed_frame = frame.copy()
@@ -374,15 +448,31 @@ class BasketballTracker:
         hoop_data = None
         player_positions = {}
 
-        # 1) 處理球場檢測
+        # ===== 修改：使用佇列多進程進行模型推理 =====
         start_time = time.time()
-        court_results = self.court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
-        self.performance_metrics['court_detection'].append(time.time() - start_time)
-
-        # 2) 處理球員、球、籃框等偵測
-        start_time = time.time()
-        player_results = self.player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
-        self.performance_metrics['player_detection'].append(time.time() - start_time)
+        
+        # 將同一幀分派給兩個模型處理
+        frame_copy = frame.copy()
+        self.player_task_queue.put((self.frame_count, frame_copy))
+        self.court_task_queue.put((self.frame_count, frame_copy))
+        
+        # 收集兩個模型的結果
+        results_collected = 0
+        player_results = None
+        court_results = None
+        
+        while results_collected < 2:
+            result_type, frame_idx, result, inference_time = self.result_queue.get()
+            if frame_idx == self.frame_count:
+                if result_type == 'player':
+                    player_results = result
+                    self.performance_metrics['player_detection'].append(inference_time)
+                elif result_type == 'court':
+                    court_results = result
+                    self.performance_metrics['court_detection'].append(inference_time)
+                results_collected += 1
+        
+        self.performance_metrics['model_inference'].append(time.time() - start_time)
 
         player_boxes = []
         team_boxes = []
@@ -791,4 +881,3 @@ class BasketballTracker:
         """更新球員狀態"""
         if player_key in self.player_states:
             self.player_states[player_key].update(state_updates)
-            11
