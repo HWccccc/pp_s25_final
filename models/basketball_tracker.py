@@ -17,38 +17,521 @@ from collections import defaultdict
 import multiprocessing as mp
 import sys
 
-# ===== 新增：佇列工作函式 =====
-def player_queue_worker(task_queue, result_queue, player_model_path, device):
-    """球員偵測佇列工作函式"""
-    print("[球員佇列工作進程] 啟動，載入模型中...")
-    model = YOLO(player_model_path).to(device)
+# ===== Pipeline 階段處理 Workers =====
+def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_path, device):
+    """Pipeline 階段1：模型推理 + 物件分類"""
+    print("[Pipeline階段1] 模型推理 + 物件分類 Worker 啟動...")
+    
+    # 載入模型
+    player_model = YOLO(player_model_path).to(device)
+    court_model = YOLO(court_model_path).to(device)
+    
+    # 類別映射
+    team_mapping = {0: '3-s', 2: 'biv'}
+    
     with torch.no_grad():
         while True:
-            task = task_queue.get()
+            task = input_q.get()
             if task is None:
-                print("[球員佇列工作進程] 收到結束訊號，退出。")
+                print("[Pipeline階段1] 收到結束訊號")
+                output_q.put(None)
                 break
-            idx, frame = task
-            start = time.time()
-            res = model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
-            t = time.time() - start
-            result_queue.put(('player', idx, res, t))
+            
+            frame_id, frame = task
+            start_time = time.time()
+            
+            # 執行實際的 YOLO 推理
+            player_results = player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+            court_results = court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+            
+            # 初始化分類結果
+            player_boxes = []
+            team_boxes = []
+            number_boxes = []
+            basketball_data = None
+            hoop_data = None
+            
+            # 處理 player model 結果並分類
+            if player_results:
+                for result in player_results:
+                    if result.boxes is not None:
+                        boxes = result.boxes
+                        for box in boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            cls = int(box.cls[0].item())
+                            track_id = int(box.id[0].item()) if box.id is not None else -1
+                            
+                            # 根據類別分類處理
+                            if cls == 1:  # ball
+                                center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                                left = (x1, y1)
+                                right = (x2, y2)
+                                basketball_data = {
+                                    'center': center,
+                                    'left': left, 
+                                    'right': right
+                                }
+                                
+                            elif cls == 3:  # hoop
+                                center = ((x1 + x2) / 2, y1)
+                                left = (x1, y1)
+                                right = (x2, y2)
+                                hoop_data = {
+                                    'center': center,
+                                    'left': left,
+                                    'right': right
+                                }
+                                
+                            elif cls == 5:  # player
+                                player_boxes.append({
+                                    'track_id': track_id,
+                                    'x1': float(x1), 'y1': float(y1),
+                                    'x2': float(x2), 'y2': float(y2)
+                                })
+                                
+                            elif cls == 0 or cls == 2:  # team boxes
+                                team_name = team_mapping.get(cls, 'unknown')
+                                team_boxes.append({
+                                    'x1': float(x1), 'y1': float(y1),
+                                    'x2': float(x2), 'y2': float(y2),
+                                    'team': team_name
+                                })
+                                
+                            elif cls == 4:  # number
+                                number_boxes.append({
+                                    'x1': float(x1), 'y1': float(y1),
+                                    'x2': float(x2), 'y2': float(y2),
+                                    'cls': cls,
+                                    'track_id': track_id
+                                })
+            
+            # 處理 court model 結果
+            court_boxes_data = []
+            if court_results:
+                for result in court_results:
+                    if result.boxes is not None:
+                        boxes = result.boxes
+                        for box in boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            cls = int(box.cls[0].item())
+                            track_id = int(box.id[0].item()) if box.id is not None else -1
+                            
+                            court_boxes_data.append({
+                                'x1': float(x1), 'y1': float(y1), 
+                                'x2': float(x2), 'y2': float(y2),
+                                'cls': cls, 'track_id': track_id
+                            })
+            
+            inference_time = time.time() - start_time
+            
+            # 傳遞已分類的資料 + 原始幀
+            results = {
+                'frame_id': frame_id,
+                'original_frame': frame,  # 加入原始幀
+                'player_boxes': player_boxes,
+                'team_boxes': team_boxes,
+                'number_boxes': number_boxes,
+                'basketball_data': basketball_data,
+                'hoop_data': hoop_data,
+                'court_boxes': court_boxes_data,
+                'inference_time': inference_time,
+                'status': 'classified'
+            }
+            
+            output_q.put((frame_id, results))
+            print(f"[Pipeline階段1] 完成 frame_{frame_id}，分類: {len(player_boxes)}球員, {len(team_boxes)}隊伍, 球:{basketball_data is not None}, 籃框:{hoop_data is not None}")
 
-def court_queue_worker(task_queue, result_queue, court_model_path, device):
-    """球場偵測佇列工作函式"""
-    print("[球場佇列工作進程] 啟動，載入模型中...")
-    model = YOLO(court_model_path).to(device)
-    with torch.no_grad():
-        while True:
-            task = task_queue.get()
-            if task is None:
-                print("[球場佇列工作進程] 收到結束訊號，退出。")
-                break
-            idx, frame = task
-            start = time.time()
-            res = model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
-            t = time.time() - start
-            result_queue.put(('court', idx, res, t))
+def pipeline_stage2_worker(input_q, output_q):
+    """Pipeline 階段2：OCR 號碼識別"""
+    print("[Pipeline階段2] OCR 號碼識別 Worker 啟動...")
+    
+    # 初始化 OCR
+    from paddleocr import PaddleOCR
+    from .number_recognizer import NumberRecognizer
+    import cv2
+    import numpy as np
+    
+    ocr = PaddleOCR(lang='en',
+                   rec_model_dir="./path_to/en_PP-OCRv3_rec_infer", 
+                   cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",
+                   use_angle_cls=False,
+                   use_gpu=True,
+                   show_log=False)
+    
+    number_recognizer = NumberRecognizer(ocr)
+    print("[Pipeline階段2] OCR 模型載入完成")
+    
+    while True:
+        task = input_q.get()
+        if task is None:
+            print("[Pipeline階段2] 收到結束訊號")
+            output_q.put(None)
+            break
+        
+        frame_id, stage1_results = task
+        start_time = time.time()
+        
+        print(f"[Pipeline階段2] 處理 frame_{frame_id} OCR 號碼識別")
+        
+        # 提取號碼識別需要的資料
+        number_boxes = stage1_results.get('number_boxes', [])
+        player_boxes = stage1_results.get('player_boxes', [])
+        team_boxes = stage1_results.get('team_boxes', [])
+        original_frame = stage1_results.get('original_frame')
+        
+        ocr_matches = []
+        
+        if number_boxes and original_frame is not None:
+            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，開始 OCR 識別")
+            
+            try:
+                # 簡化版本：直接對號碼區域進行 OCR
+                for i, num_box in enumerate(number_boxes):
+                    x1, y1, x2, y2 = int(num_box['x1']), int(num_box['y1']), int(num_box['x2']), int(num_box['y2'])
+                    
+                    # 確保座標在有效範圍內
+                    h, w = original_frame.shape[:2]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w, x2), min(h, y2)
+                    
+                    if x2 > x1 and y2 > y1:
+                        # 裁切號碼區域
+                        number_region = original_frame[y1:y2, x1:x2]
+                        
+                        # 進行 OCR 識別
+                        ocr_result = ocr.ocr(number_region, cls=False)
+                        
+                        if ocr_result and ocr_result[0]:
+                            for line in ocr_result[0]:
+                                text = line[1][0]
+                                confidence = line[1][1]
+                                
+                                # 檢查是否為數字
+                                if text.isdigit() and confidence > 0.5:
+                                    # 尋找最近的球員
+                                    min_dist = float('inf')
+                                    closest_player = None
+                                    num_center_x = (x1 + x2) / 2
+                                    num_center_y = (y1 + y2) / 2
+                                    
+                                    for player_box in player_boxes:
+                                        px1, py1, px2, py2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
+                                        player_center_x = (px1 + px2) / 2
+                                        player_center_y = (py1 + py2) / 2
+                                        
+                                        dist = ((num_center_x - player_center_x) ** 2 + (num_center_y - player_center_y) ** 2) ** 0.5
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            closest_player = player_box
+                                    
+                                    # 尋找最近的隊伍
+                                    closest_team = "unknown"
+                                    min_team_dist = float('inf')
+                                    for team_box in team_boxes:
+                                        tx1, ty1, tx2, ty2 = team_box['x1'], team_box['y1'], team_box['x2'], team_box['y2']
+                                        team_center_x = (tx1 + tx2) / 2
+                                        team_center_y = (ty1 + ty2) / 2
+                                        
+                                        dist = ((num_center_x - team_center_x) ** 2 + (num_center_y - team_center_y) ** 2) ** 0.5
+                                        if dist < min_team_dist:
+                                            min_team_dist = dist
+                                            closest_team = team_box['team']
+                                    
+                                    if closest_player and min_dist < 100:  # 距離閾值
+                                        ocr_matches.append({
+                                            'player_id': closest_player['track_id'],
+                                            'team': closest_team,
+                                            'number': int(text),
+                                            'confidence': confidence,
+                                            'ocr_text': text,
+                                            'distance': min_dist
+                                        })
+                                        
+                                        print(f"[Pipeline階段2] 識別號碼: {text} (信心度: {confidence:.2f}) -> 球員ID {closest_player['track_id']} 隊伍 {closest_team}")
+                
+                print(f"[Pipeline階段2] 成功識別 {len(ocr_matches)} 個號碼匹配")
+                
+            except Exception as e:
+                print(f"[Pipeline階段2] OCR 識別錯誤: {e}")
+                import traceback
+                traceback.print_exc()
+                ocr_matches = []
+        
+        elif number_boxes:
+            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，但缺少原始幀")
+        else:
+            print(f"[Pipeline階段2] 未找到號碼區域")
+        
+        ocr_time = time.time() - start_time
+        
+        # 將 OCR 結果加入 stage1 結果中，保持原始幀傳遞
+        results = stage1_results.copy()
+        results.update({
+            'ocr_matches': ocr_matches,
+            'ocr_time': ocr_time,
+            'stage2_status': 'ocr_completed'
+        })
+        
+        output_q.put((frame_id, results))
+        print(f"[Pipeline階段2] 完成 frame_{frame_id} OCR 處理，耗時: {ocr_time:.3f}s")
+
+def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
+    """Pipeline 階段3：進籃分析 + 球場映射 + 狀態更新 + 畫面繪製 (必須按順序)"""
+    print("[Pipeline階段3] 進籃分析 + 球場映射 + 狀態更新 Worker 啟動...")
+    
+    # 初始化分析器 (在 Worker 內部建立)
+    from .scoring_analyzer import ScoringAnalyzer
+    from .coordinate_mapper import CoordinateMapper
+    import cv2
+    import numpy as np
+    
+    scoring_analyzer = ScoringAnalyzer()
+    coordinate_mapper = CoordinateMapper()
+    
+    # 從 config 取得設定
+    output_width = config['output_width']
+    output_height = config['output_height']
+    class_names = config['class_names']
+    team_mapping = config['team_mapping']
+    
+    # 球場相關設定
+    court_image = None
+    image_points = None
+    if config.get('court_image_path'):
+        court_image = cv2.imread(config['court_image_path'])
+        image_points = config.get('image_points')
+        if image_points is not None:
+            coordinate_mapper.set_reference(config['court_image_path'], image_points)
+    
+    # 顏色生成函數
+    def get_color_from_id(track_id):
+        if track_id is None:
+            return (255, 255, 255)
+        seed_value = abs(hash(str(track_id))) % (2 ** 32 - 1)
+        np.random.seed(seed_value)
+        color = tuple(np.random.randint(0, 255, size=3).tolist())
+        return color
+    
+    while True:
+        task = input_q.get()
+        if task is None:
+            print("[Pipeline階段3] 收到結束訊號")
+            output_q.put(None)
+            break
+        
+        frame_id, stage2_results = task
+        
+        # 等待前一幀完成 (保持時序)
+        previous_event, current_event = frame_completion_events.get(frame_id, (None, None))
+        if previous_event:
+            print(f"[Pipeline階段3] frame_{frame_id} 等待前一幀...")
+            previous_event.wait()
+        
+        start_time = time.time()
+        print(f"[Pipeline階段3] 處理 frame_{frame_id} 分析與狀態更新")
+        
+        # 提取所需資料
+        basketball_data = stage2_results.get('basketball_data')
+        hoop_data = stage2_results.get('hoop_data')
+        player_boxes = stage2_results.get('player_boxes', [])
+        court_boxes = stage2_results.get('court_boxes', [])
+        team_boxes = stage2_results.get('team_boxes', [])
+        ocr_matches = stage2_results.get('ocr_matches', [])
+        original_frame = stage2_results.get('original_frame')  # 需要從 stage1 傳遞原始幀
+        
+        # === 1. 進籃分析 ===
+        scores_updated = False
+        if basketball_data and hoop_data:
+            # 轉換資料格式為原本的 tuple 格式
+            ball_tuple = (basketball_data['center'], basketball_data['left'], basketball_data['right'])
+            hoop_tuple = (hoop_data['center'], hoop_data['left'], hoop_data['right'])
+            
+            scoring_analyzer.update_positions(ball_tuple, hoop_tuple)
+            
+            # 檢查得分
+            scored, team = scoring_analyzer.check_scoring(basketball_data['center'], hoop_data['center'])
+            if scored:
+                print(f"[Pipeline階段3] 進球！得分方：{team}")
+                scores_updated = True
+        
+        # 預測籃球位置（如果沒有偵測到）
+        if not basketball_data:
+            predicted_pos = scoring_analyzer.predict_basketball_position()
+            if predicted_pos:
+                basketball_data = {'center': predicted_pos, 'left': None, 'right': None}
+        
+        # === 2. 球場映射與軌跡 ===
+        court_frame = None
+        if court_image is not None:
+            court_frame = court_image.copy()
+            
+            # 處理球場映射
+            current_video_points = None
+            for court_box in court_boxes:
+                if court_box['cls'] == 1:  # RA area (假設)
+                    # 這裡需要 extract_geometric_points 邏輯
+                    # 暫時用簡化版本
+                    x1, y1, x2, y2 = court_box['x1'], court_box['y1'], court_box['x2'], court_box['y2']
+                    current_video_points = np.array([
+                        [x1, y1], [x1, y2], [x2, y1], [x2, y2]
+                    ], dtype=np.float32)
+                    break
+            
+            # 處理球員軌跡
+            if current_video_points is not None and image_points is not None:
+                try:
+                    H, _ = cv2.findHomography(current_video_points, image_points)
+                    
+                    for player_box in player_boxes:
+                        track_id = player_box['track_id']
+                        x1, y1, x2, y2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
+                        
+                        # 計算球員腳部位置
+                        player_point = np.array([[(x1 + x2) / 2, y2]], dtype=np.float32).reshape(1, 1, 2)
+                        projected_point = cv2.perspectiveTransform(player_point, H)
+                        x, y = int(projected_point[0][0][0]), int(projected_point[0][0][1])
+                        
+                        # 追蹤移動
+                        total_distance = coordinate_mapper.track_movement(track_id, [x, y])
+                        
+                        # 繪製軌跡
+                        if track_id in coordinate_mapper.tracking_data:
+                            positions = coordinate_mapper.tracking_data[track_id]['positions']
+                            color = coordinate_mapper.tracking_data[track_id]['color']
+                            
+                            # 繪製軌跡線
+                            if len(positions) > 1:
+                                for i in range(len(positions) - 1):
+                                    pt1 = tuple(map(int, positions[i]))
+                                    pt2 = tuple(map(int, positions[i + 1]))
+                                    cv2.line(court_frame, pt1, pt2, color, 2)
+                            
+                            # 繪製當前位置
+                            cv2.circle(court_frame, (x, y), 5, color, -1)
+                            cv2.putText(court_frame, f"ID:{track_id} Dist:{total_distance:.1f}m",
+                                       (x + 5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                
+                except Exception as e:
+                    print(f"[Pipeline階段3] 球場映射錯誤: {e}")
+        
+        # === 4. 處理 OCR 號碼匹配結果 ===
+        if ocr_matches:
+            print(f"[Pipeline階段3] 處理 {len(ocr_matches)} 個 OCR 號碼匹配")
+            # 這裡需要更新球員註冊表和關聯
+            # 但由於我們在 Worker 中，無法直接存取主進程的 player_registry
+            # 暫時先記錄，或者考慮其他方式同步
+            for match in ocr_matches:
+                print(f"[Pipeline階段3] 識別到球員: ID {match['player_id']}, 隊伍 {match['team']}, 號碼 {match['number']}")
+        
+        # === 3. 畫面繪製 ===
+        # 使用原始影片作為底圖，如果沒有就建立黑色畫面
+        if original_frame is not None:
+            processed_frame = original_frame.copy()
+            # 縮放到輸出尺寸
+            processed_frame = cv2.resize(processed_frame, (output_width, output_height))
+        else:
+            # 如果沒有原始幀，建立黑色畫面
+            processed_frame = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+        
+        # 繪製籃球
+        if basketball_data and basketball_data['center']:
+            center = basketball_data['center']
+            left = basketball_data['left']
+            right = basketball_data['right']
+            if left and right:
+                # 調整座標到輸出尺寸
+                x1 = int(left[0] * output_width / (original_frame.shape[1] if original_frame is not None else output_width))
+                y1 = int(left[1] * output_height / (original_frame.shape[0] if original_frame is not None else output_height))
+                x2 = int(right[0] * output_width / (original_frame.shape[1] if original_frame is not None else output_width))
+                y2 = int(right[1] * output_height / (original_frame.shape[0] if original_frame is not None else output_height))
+                
+                cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(processed_frame, "BALL", (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # 繪製球員
+        for player_box in player_boxes:
+            track_id = player_box['track_id']
+            x1, y1, x2, y2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
+            
+            # 調整座標到輸出尺寸
+            if original_frame is not None:
+                x1 = int(x1 * output_width / original_frame.shape[1])
+                y1 = int(y1 * output_height / original_frame.shape[0])
+                x2 = int(x2 * output_width / original_frame.shape[1])
+                y2 = int(y2 * output_height / original_frame.shape[0])
+            
+            color = get_color_from_id(track_id)
+            
+            # 檢查是否有對應的 OCR 識別結果
+            player_label = f"Player {track_id}"
+            for match in ocr_matches:
+                if match['player_id'] == track_id:
+                    player_label = f"{match['team']} #{match['number']}"
+                    break
+            
+            cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.putText(processed_frame, player_label,
+                       (int(x1), int(y1) - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # 繪製隊伍
+        for team_box in team_boxes:
+            x1, y1, x2, y2 = team_box['x1'], team_box['y1'], team_box['x2'], team_box['y2']
+            team = team_box['team']
+            
+            # 調整座標到輸出尺寸
+            if original_frame is not None:
+                x1 = int(x1 * output_width / original_frame.shape[1])
+                y1 = int(y1 * output_height / original_frame.shape[0])
+                x2 = int(x2 * output_width / original_frame.shape[1])
+                y2 = int(y2 * output_height / original_frame.shape[0])
+            
+            color = (255, 0, 0) if team == '3-s' else (0, 0, 255)
+            
+            cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            cv2.putText(processed_frame, team, (int(x1), int(y1) - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # 繪製籃框
+        if hoop_data and hoop_data['center']:
+            center = hoop_data['center']
+            left = hoop_data['left']
+            right = hoop_data['right']
+            if left and right:
+                # 調整座標到輸出尺寸
+                x1 = int(left[0] * output_width / (original_frame.shape[1] if original_frame is not None else output_width))
+                y1 = int(left[1] * output_height / (original_frame.shape[0] if original_frame is not None else output_height))
+                x2 = int(right[0] * output_width / (original_frame.shape[1] if original_frame is not None else output_width))
+                y2 = int(right[1] * output_height / (original_frame.shape[0] if original_frame is not None else output_height))
+                
+                cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                cv2.putText(processed_frame, "HOOP", (x1, y1 - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        
+        # 縮放球場畫面
+        if court_frame is not None:
+            court_frame = cv2.resize(court_frame, (output_width, output_height))
+        
+        # 獲取當前得分
+        current_scores = scoring_analyzer.get_scores()
+        
+        final_results = {
+            'processed_frame': processed_frame,
+            'court_frame': court_frame,
+            'detected_players': [],  # 簡化版本先不處理
+            'scores': current_scores,
+            'scores_updated': scores_updated,
+            'stage3_time': time.time() - start_time,
+            'stage3_status': 'completed'
+        }
+        
+        output_q.put((frame_id, final_results))
+        
+        # 通知下一幀可以開始
+        if current_event:
+            current_event.set()
+            print(f"[Pipeline階段3] frame_{frame_id} 完成，得分: {current_scores}")
 
 class BasketballTracker:
     def __init__(self, player_model_path, court_model_path, data_folder):
@@ -59,38 +542,62 @@ class BasketballTracker:
         self.player_model_path = player_model_path
         self.court_model_path = court_model_path
 
-        # ===== 新增：佇列多進程設置 =====
-        # 設定多進程啟動方法
+        # ===== Pipeline 多進程設置 =====
         if sys.platform in ['win32', 'darwin']:
             try:
                 mp.set_start_method("spawn", force=True)
             except RuntimeError:
                 pass
-        
-        # 建立佇列和工作進程
-        self.ctx = mp.get_context("spawn")
-        self.player_task_queue = self.ctx.Queue(maxsize=10)
-        self.court_task_queue = self.ctx.Queue(maxsize=10)
-        self.result_queue = self.ctx.Queue()
-        
-        # 啟動工作進程
-        self.player_process = self.ctx.Process(
-            target=player_queue_worker,
-            args=(self.player_task_queue, self.result_queue, player_model_path, self.device)
-        )
-        self.court_process = self.ctx.Process(
-            target=court_queue_worker,
-            args=(self.court_task_queue, self.result_queue, court_model_path, self.device)
-        )
-        self.player_process.daemon = True
-        self.court_process.daemon = True
-        self.player_process.start()
-        self.court_process.start()
 
-        # 移除原本的模型載入（改為在工作進程中載入）
-        # self.player_model = YOLO(player_model_path).to(self.device)
-        # self.court_model = YOLO(court_model_path).to(self.device)
-        print(f"佇列多進程模式已啟動")
+        self.ctx = mp.get_context("spawn")
+
+        # 建立 Pipeline 三階段佇列
+        self.stage1_input_q = self.ctx.Queue(maxsize=5)
+        self.stage1_to_stage2_q = self.ctx.Queue(maxsize=5)  
+        self.stage2_to_stage3_q = self.ctx.Queue(maxsize=5)
+        self.stage3_output_q = self.ctx.Queue()
+
+        # 幀完成事件字典 (用於階段3順序控制)
+        self.frame_completion_events = {}
+        self.previous_frame_event = None
+
+        # 啟動 Pipeline 三個 Workers
+        self.stage1_process = self.ctx.Process(
+            target=pipeline_stage1_worker,
+            args=(self.stage1_input_q, self.stage1_to_stage2_q, 
+                  player_model_path, court_model_path, self.device)
+        )
+
+        self.stage2_process = self.ctx.Process(
+            target=pipeline_stage2_worker,
+            args=(self.stage1_to_stage2_q, self.stage2_to_stage3_q)
+        )
+
+        # 準備 Stage3 需要的分析器和配置
+        stage3_config = {
+            'output_width': 640,
+            'output_height': 480,
+            'class_names': ['3-s', 'ball', 'biv', 'hoop', 'number', 'player'],
+            'team_mapping': {0: '3-s', 2: 'biv'},
+            'court_image_path': None,  # 會在 set_court_reference 時更新
+            'image_points': None
+        }
+
+        self.stage3_process = self.ctx.Process(
+            target=pipeline_stage3_worker,
+            args=(self.stage2_to_stage3_q, self.stage3_output_q, 
+                  self.frame_completion_events, stage3_config)
+        )
+
+        # self.stage1_process.daemon = True
+        # self.stage2_process.daemon = True  
+        # self.stage3_process.daemon = True
+
+        self.stage1_process.start()
+        self.stage2_process.start()
+        self.stage3_process.start()
+
+        print(f"Pipeline 多進程模式已啟動")
 
         import paddle
         print(paddle.is_compiled_with_cuda())  # 如果返回 False，表示 Paddle 未啟用 GPU 支援
@@ -232,6 +739,9 @@ class BasketballTracker:
             [853, 567]  # bottom_right
         ], dtype=np.float32)
         self.coordinate_mapper.set_reference(court_image_path, self.image_points)
+        
+        # 更新 Stage3 的球場設定 (需要重新啟動 Stage3 進程)
+        # 暫時先不動態更新，等架構穩定後再優化
 
     def update_display_options(self, player=True, ball=True, team=True, number=True, trajectory=True):
         """更新顯示選項"""
@@ -345,25 +855,23 @@ class BasketballTracker:
 
     def release(self):
         """釋放資源"""
-        # ===== 新增：關閉佇列多進程 =====
+        # ===== 關閉 Pipeline 多進程 =====
         try:
-            # 發送結束訊號
-            self.player_task_queue.put(None)
-            self.court_task_queue.put(None)
+            # 發送結束訊號給所有階段
+            self.stage1_input_q.put(None)
+            self.stage1_to_stage2_q.put(None)
+            self.stage2_to_stage3_q.put(None)
             
             # 等待進程結束
-            self.player_process.join(timeout=3)
-            self.court_process.join(timeout=3)
-            
-            # 強制終止未結束的進程
-            if self.player_process.is_alive():
-                self.player_process.terminate()
-            if self.court_process.is_alive():
-                self.court_process.terminate()
-                
-            print("佇列多進程已關閉")
+            for process in [self.stage1_process, self.stage2_process, self.stage3_process]:
+                process.join(timeout=3)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+                    
+            print("Pipeline 多進程已關閉")
         except Exception as e:
-            print(f"關閉佇列多進程時發生錯誤: {e}")
+            print(f"關閉 Pipeline 多進程時發生錯誤: {e}")
 
         if self.video_capture is not None:
             self.video_capture.release()
@@ -427,7 +935,7 @@ class BasketballTracker:
                 print(f"  Minimum: {stats[f'{step}_min'] * 1000:.2f} ms")
 
     def process_frame(self, frame):
-        """處理單一幀"""
+        """處理單一幀 - 使用 Pipeline 架構"""
         if frame is None:
             return None, None, None
 
@@ -435,190 +943,46 @@ class BasketballTracker:
         self.frame_count += 1
         self.total_frames_processed += 1
 
-        self.last_frame_time = time.time()
+        # 設置當前幀的完成事件
+        current_frame_event = self.ctx.Event()
+        self.frame_completion_events[self.frame_count] = (self.previous_frame_event, current_frame_event)
+        self.previous_frame_event = current_frame_event
 
-        processed_frame = frame.copy()
-        court_frame = self.court_image.copy() if self.court_image is not None else None
-        detected_players = []
-
-        with self.lock:
-            display_options = self.display_options.copy()
-
-        basketball_data = None
-        hoop_data = None
-        player_positions = {}
-
-        # ===== 修改：使用佇列多進程進行模型推理 =====
-        start_time = time.time()
-        
-        # 將同一幀分派給兩個模型處理
+        # 將幀送入 Pipeline 階段1
         frame_copy = frame.copy()
-        self.player_task_queue.put((self.frame_count, frame_copy))
-        self.court_task_queue.put((self.frame_count, frame_copy))
-        
-        # 收集兩個模型的結果
-        results_collected = 0
-        player_results = None
-        court_results = None
-        
-        while results_collected < 2:
-            result_type, frame_idx, result, inference_time = self.result_queue.get()
-            if frame_idx == self.frame_count:
-                if result_type == 'player':
-                    player_results = result
-                    self.performance_metrics['player_detection'].append(inference_time)
-                elif result_type == 'court':
-                    court_results = result
-                    self.performance_metrics['court_detection'].append(inference_time)
-                results_collected += 1
-        
-        self.performance_metrics['model_inference'].append(time.time() - start_time)
+        self.stage1_input_q.put((self.frame_count, frame_copy))
+        print(f"[主進程] 將 frame_{self.frame_count} 送入 Pipeline")
 
-        player_boxes = []
-        team_boxes = []
-        number_boxes = []
+        # 等待 Pipeline 處理完成
+        try:
+            frame_id, final_results = self.stage3_output_q.get(timeout=30)
+            print(f"[主進程] 收到 frame_{frame_id} 的最終結果")
+            
+            # 取得 Pipeline 處理結果
+            processed_frame = final_results.get('processed_frame')
+            court_frame = final_results.get('court_frame')
+            detected_players = final_results.get('detected_players', [])
+            scores = final_results.get('scores', {})
+            scores_updated = final_results.get('scores_updated', False)
+            
+            # 如果得分更新，觸發回調
+            if scores_updated and self.score_callback:
+                self.score_callback(scores)
+            
+            # 更新總處理時間
+            self.total_processing_time += time.time() - frame_start_time
+            
+            return processed_frame, court_frame, detected_players
+            
+        except Exception as e:
+            print(f"[主進程] Pipeline 處理錯誤: {e}")
+            return None, None, None
 
-        # 3) 物件分析與追蹤
-        start_time = time.time()
-        if player_results:
-            for result in player_results:
-                boxes = result.boxes
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    cls = int(box.cls[0].item())
-                    track_id = int(box.id[0].item()) if box.id is not None else -1
-
-                    # 修改類別名稱映射
-                    class_display = {
-                        0: "3-s",  # 3-s -> 3fm
-                        1: "ball",
-                        2: "biv",  # biv -> b
-                        3: "hoop",
-                        4: "Num",  # number -> N
-                        5: "Player"  # player -> P
-                    }
-
-                    if cls == 1:  # ball
-                        center = ((x1 + x2) / 2, (y1 + y2) / 2)
-                        left = (x1, y1)
-                        right = (x2, y2)
-                        basketball_data = (center, left, right)
-                        if display_options['ball']:
-                            cv2.rectangle(processed_frame,
-                                          (int(x1), int(y1)),
-                                          (int(x2), int(y2)),
-                                          (0, 255, 0), 2)
-
-                    elif cls == 3:  # hoop
-                        center = ((x1 + x2) / 2, y1)
-                        left = (x1, y1)
-                        right = (x2, y2)
-                        hoop_data = (center, left, right)
-
-                    elif cls == 5:  # player
-                        player_boxes.append((track_id, x1, y1, x2, y2))
-
-                    # 先檢查是否有關聯的球員資訊
-                    team = None
-                    if track_id in self.player_associations:
-                        pkey = self.player_associations[track_id]
-                        if pkey in self.player_registry:
-                            self.player_registry[pkey]['last_seen'] = self.frame_count
-                            team = self.player_registry[pkey]['team']
-                            player_positions[track_id] = (x1, y1, x2, y2, team)
-
-                    elif cls == 0 or cls == 2:  # team boxes
-                        team_name = self.team_mapping.get(cls, 'unknown')
-                        team_boxes.append((x1, y1, x2, y2, team_name))
-
-                    elif cls == 4:  # number
-                        number_boxes.append(box)
-
-                    # 3) 繪製標記 (若符合對應的顯示選項)
-                    should_draw = ((cls == 5 and display_options['player']) or
-                                   ((cls == 0 or cls == 2) and display_options['team']) or
-                                   (cls == 4 and display_options['number']))
-
-                    if should_draw:
-                        color = self.get_color_from_id(track_id)
-                        cv2.rectangle(processed_frame,
-                                      (int(x1), int(y1)),
-                                      (int(x2), int(y2)),
-                                      color, 2)
-
-                        # 修改後的標籤邏輯：只顯示簡化的類別名稱
-                        label = class_display[cls]
-                        if track_id in self.player_associations:
-                            player_key = self.player_associations[track_id]
-                            if player_key in self.player_registry:
-                                assoc_data = self.player_registry[player_key]
-                                label = f"{class_display[cls]} {assoc_data['team']}#{assoc_data['number']}"
-
-                        cv2.putText(processed_frame,
-                                    label,
-                                    (int(x1), int(y1) - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    color,
-                                    2)
-
-        self.performance_metrics['object_tracking'].append(time.time() - start_time)
-
-        # 4) 進籃分析
-        start_time = time.time()
-        if basketball_data and hoop_data:
-            self.scoring_analyzer.update_positions(basketball_data, hoop_data)
-
-        if not basketball_data:
-            predicted_pos = self.scoring_analyzer.predict_basketball_position()
-            if predicted_pos:
-                basketball_data = (predicted_pos, None, None)
-
-        if basketball_data and basketball_data[0]:
-            self.scoring_analyzer.update_last_touch(basketball_data[0], player_positions)
-
-        # 檢查得分並通過回調更新
-        if basketball_data and hoop_data:
-            scored, team = self.scoring_analyzer.check_scoring(basketball_data[0], hoop_data[0])
-            if scored:
-                print(f"進球！得分方：{team}")
-                if self.score_callback:
-                    scores = self.scoring_analyzer.get_scores()
-                    self.score_callback(scores)
-        self.performance_metrics['scoring_analysis'].append(time.time() - start_time)
-
-        # 5) 球場分析與映射
-        start_time = time.time()
-        if court_results and display_options['trajectory']:
-            self._process_court_mapping(court_results, player_boxes, court_frame)
-        self.performance_metrics['court_mapping'].append(time.time() - start_time)
-
-        # 6) 號碼識別
-        start_time = time.time()
-        if number_boxes:
-            matches = self.number_recognizer.match_numbers_to_players(
-                frame, player_boxes, number_boxes, team_boxes)
-            filtered_matches = self.number_recognizer.filter_matches(matches)
-            self._process_number_matches(filtered_matches)
-        self.performance_metrics['number_recognition'].append(time.time() - start_time)
-
-        # 7) 更新球員狀態
-        start_time = time.time()
-        detected_players = self._update_player_states(player_boxes)
-        self.performance_metrics['player_state_update'].append(time.time() - start_time)
-
-        # 8) 最終處理
-        start_time = time.time()
-        if processed_frame is not None:
-            processed_frame = cv2.resize(processed_frame, (self.output_width, self.output_height))
-        if court_frame is not None:
-            court_frame = cv2.resize(court_frame, (self.output_width, self.output_height))
-        self.performance_metrics['final_processing'].append(time.time() - start_time)
-
-        # 更新總處理時間
-        self.total_processing_time += time.time() - frame_start_time
-
-        return processed_frame, court_frame, detected_players
+    def _create_mock_frame(self, text):
+        """建立模擬的輸出畫面"""
+        frame = np.zeros((self.output_height, self.output_width, 3), dtype=np.uint8)
+        cv2.putText(frame, text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        return frame
 
     def _handle_scoring(self, scoring_info):
         """
