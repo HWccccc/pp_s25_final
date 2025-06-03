@@ -17,7 +17,7 @@ from collections import defaultdict
 import multiprocessing as mp
 import sys
 
-# ===== Pipeline 階段處理 Workers =====
+# ===== Pipeline 階段處理 Workers (保持原有不變) =====
 def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_path, device):
     """Pipeline 階段1：模型推理 + 物件分類"""
     print("[Pipeline階段1] 模型推理 + 物件分類 Worker 啟動...")
@@ -534,13 +534,19 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             print(f"[Pipeline階段3] frame_{frame_id} 完成，得分: {current_scores}")
 
 class BasketballTracker:
-    def __init__(self, player_model_path, court_model_path, data_folder):
+    def __init__(self, player_model_path, court_model_path, data_folder, max_parallel_frames=3):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"使用設備: {self.device}")
 
         # 儲存模型路徑（用於多進程）
         self.player_model_path = player_model_path
         self.court_model_path = court_model_path
+
+        # ===== 新增：並行控制參數 =====
+        self.max_parallel_frames = max_parallel_frames
+        self.frames_in_pipeline = 0
+        self.pending_results = {}  # frame_id -> 等待的結果
+        self.next_expected_frame = 1  # 下一個期待的輸出 frame
 
         # ===== Pipeline 多進程設置 =====
         if sys.platform in ['win32', 'darwin']:
@@ -551,11 +557,11 @@ class BasketballTracker:
 
         self.ctx = mp.get_context("spawn")
 
-        # 建立 Pipeline 三階段佇列
-        self.stage1_input_q = self.ctx.Queue(maxsize=5)
-        self.stage1_to_stage2_q = self.ctx.Queue(maxsize=5)  
-        self.stage2_to_stage3_q = self.ctx.Queue(maxsize=5)
-        self.stage3_output_q = self.ctx.Queue()
+        # 建立 Pipeline 三階段佇列（支援並行）
+        self.stage1_input_q = self.ctx.Queue(maxsize=max_parallel_frames)
+        self.stage1_to_stage2_q = self.ctx.Queue(maxsize=max_parallel_frames)  
+        self.stage2_to_stage3_q = self.ctx.Queue(maxsize=max_parallel_frames)
+        self.stage3_output_q = self.ctx.Queue(maxsize=max_parallel_frames)
 
         # 幀完成事件字典 (用於階段3順序控制)
         self.frame_completion_events = {}
@@ -589,15 +595,11 @@ class BasketballTracker:
                   self.frame_completion_events, stage3_config)
         )
 
-        # self.stage1_process.daemon = True
-        # self.stage2_process.daemon = True  
-        # self.stage3_process.daemon = True
-
         self.stage1_process.start()
         self.stage2_process.start()
         self.stage3_process.start()
 
-        print(f"Pipeline 多進程模式已啟動")
+        print(f"Pipeline 多進程模式已啟動，最大並行幀數: {max_parallel_frames}")
 
         import paddle
         print(paddle.is_compiled_with_cuda())  # 如果返回 False，表示 Paddle 未啟用 GPU 支援
@@ -674,6 +676,147 @@ class BasketballTracker:
         # 設定輸出解析度
         self.output_width = 640
         self.output_height = 480
+
+    def process_frame(self, frame):
+        """修改版：支援流水線並行處理"""
+        if frame is None:
+            return None, None, None
+
+        frame_start_time = time.time()
+        self.frame_count += 1
+        self.total_frames_processed += 1
+
+        # 1. 檢查是否需要先收集結果以控制並行數量
+        if self.frames_in_pipeline >= self.max_parallel_frames:
+            print(f"[主進程] 達到最大並行數 {self.max_parallel_frames}，先收集一個結果")
+            self._collect_one_result()
+
+        # 2. 設置當前幀的完成事件
+        current_frame_event = self.ctx.Event()
+        self.frame_completion_events[self.frame_count] = (self.previous_frame_event, current_frame_event)
+        self.previous_frame_event = current_frame_event
+
+        # 3. 送入新 frame 到 Pipeline（非阻塞）
+        frame_copy = frame.copy()
+        self.stage1_input_q.put((self.frame_count, frame_copy))
+        self.frames_in_pipeline += 1
+        print(f"[主進程] 將 frame_{self.frame_count} 送入 Pipeline，目前並行: {self.frames_in_pipeline}")
+
+        # 4. 嘗試取得已完成的結果（依序輸出）
+        result = self._get_next_sequential_result()
+        
+        if result is not None:
+            frame_id, final_results = result
+            print(f"[主進程] 輸出 frame_{frame_id} 結果")
+            
+            # 取得 Pipeline 處理結果
+            processed_frame = final_results.get('processed_frame')
+            court_frame = final_results.get('court_frame')
+            detected_players = final_results.get('detected_players', [])
+            scores = final_results.get('scores', {})
+            scores_updated = final_results.get('scores_updated', False)
+            
+            # 如果得分更新，觸發回調
+            if scores_updated and self.score_callback:
+                self.score_callback(scores)
+            
+            # 更新總處理時間
+            self.total_processing_time += time.time() - frame_start_time
+            
+            return processed_frame, court_frame, detected_players
+        else:
+            # 如果沒有可輸出的結果，返回 None（表示需要等待）
+            print(f"[主進程] frame_{self.frame_count} 已送入，等待結果...")
+            return None, None, None
+
+    def _collect_one_result(self):
+        """收集一個結果以控制並行數量"""
+        try:
+            frame_id, final_results = self.stage3_output_q.get(timeout=30)
+            self.frames_in_pipeline -= 1
+            
+            # 暫存結果，等待依序輸出
+            self.pending_results[frame_id] = final_results
+            print(f"[主進程] 收集到 frame_{frame_id} 結果，等待依序輸出")
+            
+        except Exception as e:
+            print(f"[主進程] 收集結果錯誤: {e}")
+            self.frames_in_pipeline = max(0, self.frames_in_pipeline - 1)
+
+    def _get_next_sequential_result(self):
+        """取得下一個依序的結果"""
+        # 先檢查是否有新完成的結果
+        while not self.stage3_output_q.empty():
+            try:
+                frame_id, final_results = self.stage3_output_q.get_nowait()
+                self.frames_in_pipeline -= 1
+                self.pending_results[frame_id] = final_results
+                print(f"[主進程] 收集到 frame_{frame_id} 結果")
+            except:
+                break
+
+        # 檢查是否可以輸出下一個期待的 frame
+        if self.next_expected_frame in self.pending_results:
+            result = (self.next_expected_frame, self.pending_results[self.next_expected_frame])
+            del self.pending_results[self.next_expected_frame]
+            self.next_expected_frame += 1
+            return result
+        
+        return None
+
+    def get_pending_results(self):
+        """強制取得所有 pending 的結果（用於視頻結束時）"""
+        results = []
+        
+        # 收集剩餘的所有結果
+        while self.frames_in_pipeline > 0:
+            try:
+                frame_id, final_results = self.stage3_output_q.get(timeout=30)
+                self.frames_in_pipeline -= 1
+                self.pending_results[frame_id] = final_results
+                print(f"[主進程] 最終收集 frame_{frame_id} 結果")
+            except Exception as e:
+                print(f"[主進程] 最終收集錯誤: {e}")
+                break
+
+        # 依序輸出所有結果
+        while self.pending_results:
+            if self.next_expected_frame in self.pending_results:
+                frame_id = self.next_expected_frame
+                final_results = self.pending_results[frame_id]
+                del self.pending_results[frame_id]
+                
+                processed_frame = final_results.get('processed_frame')
+                court_frame = final_results.get('court_frame')
+                detected_players = final_results.get('detected_players', [])
+                
+                results.append((frame_id, processed_frame, court_frame, detected_players))
+                self.next_expected_frame += 1
+                print(f"[主進程] 最終輸出 frame_{frame_id}")
+            else:
+                # 如果有跳號，停止輸出
+                break
+                
+        return results
+
+    def reset_pipeline(self):
+        """重置 pipeline 狀態"""
+        self.frames_in_pipeline = 0
+        self.pending_results.clear()
+        self.next_expected_frame = 1
+        self.frame_completion_events.clear()
+        self.previous_frame_event = None
+        self.frame_count = 0
+
+    def get_pipeline_status(self):
+        """取得 pipeline 狀態資訊"""
+        return {
+            'frames_in_pipeline': self.frames_in_pipeline,
+            'pending_results_count': len(self.pending_results),
+            'next_expected_frame': self.next_expected_frame,
+            'max_parallel_frames': self.max_parallel_frames,
+            'current_frame_count': self.frame_count
+        }
 
     def get_player_info(self, team, number):
         """從DataManager獲取球員信息"""
@@ -792,7 +935,7 @@ class BasketballTracker:
         self.is_playing = False
 
     def next_frame(self):
-        """前進一幀"""
+        """修改版：支援流水線處理"""
         if self.video_capture is None:
             return None, None, None
 
@@ -803,7 +946,27 @@ class BasketballTracker:
                 self.frame_buffer.pop(0)
             self.frame_buffer.append(frame)
             self.current_frame_index = len(self.frame_buffer) - 1
-            return self.process_frame(frame)
+            
+            result = self.process_frame(frame)
+            
+            # 如果當前幀沒有立即結果，嘗試取得 pending 結果
+            if result[0] is None and result[1] is None and result[2] is None:
+                pending_result = self._get_next_sequential_result()
+                if pending_result:
+                    frame_id, final_results = pending_result
+                    processed_frame = final_results.get('processed_frame')
+                    court_frame = final_results.get('court_frame') 
+                    detected_players = final_results.get('detected_players', [])
+                    return processed_frame, court_frame, detected_players
+            
+            return result
+        else:
+            # 視頻結束，輸出所有 pending 結果
+            pending_results = self.get_pending_results()
+            if pending_results:
+                frame_id, processed_frame, court_frame, detected_players = pending_results[0]
+                return processed_frame, court_frame, detected_players
+            
         return None, None, None
 
     def prev_frame(self):
@@ -845,6 +1008,9 @@ class BasketballTracker:
         if self.video_capture is None:
             return False
 
+        # 重置 pipeline 狀態
+        self.reset_pipeline()
+        
         self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ret, frame = self.video_capture.read()
         if ret:
@@ -872,6 +1038,9 @@ class BasketballTracker:
             print("Pipeline 多進程已關閉")
         except Exception as e:
             print(f"關閉 Pipeline 多進程時發生錯誤: {e}")
+
+        # 重置 pipeline 狀態
+        self.reset_pipeline()
 
         if self.video_capture is not None:
             self.video_capture.release()
@@ -934,49 +1103,88 @@ class BasketballTracker:
                 print(f"  Maximum: {stats[f'{step}_max'] * 1000:.2f} ms")
                 print(f"  Minimum: {stats[f'{step}_min'] * 1000:.2f} ms")
 
-    def process_frame(self, frame):
-        """處理單一幀 - 使用 Pipeline 架構"""
-        if frame is None:
-            return None, None, None
+    def reset_performance_metrics(self):
+        """重置性能指標"""
+        self.performance_metrics.clear()
+        self.total_frames_processed = 0
+        self.total_processing_time = 0
 
-        frame_start_time = time.time()
-        self.frame_count += 1
-        self.total_frames_processed += 1
+    def reset_scores(self):
+        """重置所有得分"""
+        self.scoring_analyzer.reset_scores()
+        # 重置分數時也要通知更新
+        if self.score_callback:
+            self.score_callback(self.scoring_analyzer.get_scores())
 
-        # 設置當前幀的完成事件
-        current_frame_event = self.ctx.Event()
-        self.frame_completion_events[self.frame_count] = (self.previous_frame_event, current_frame_event)
-        self.previous_frame_event = current_frame_event
+    def get_current_scores(self):
+        """獲取當前比分"""
+        return self.scoring_analyzer.get_scores()
 
-        # 將幀送入 Pipeline 階段1
-        frame_copy = frame.copy()
-        self.stage1_input_q.put((self.frame_count, frame_copy))
-        print(f"[主進程] 將 frame_{self.frame_count} 送入 Pipeline")
-
-        # 等待 Pipeline 處理完成
+    def save_frame(self, frame, filename):
+        """儲存當前畫面"""
         try:
-            frame_id, final_results = self.stage3_output_q.get(timeout=30)
-            print(f"[主進程] 收到 frame_{frame_id} 的最終結果")
-            
-            # 取得 Pipeline 處理結果
-            processed_frame = final_results.get('processed_frame')
-            court_frame = final_results.get('court_frame')
-            detected_players = final_results.get('detected_players', [])
-            scores = final_results.get('scores', {})
-            scores_updated = final_results.get('scores_updated', False)
-            
-            # 如果得分更新，觸發回調
-            if scores_updated and self.score_callback:
-                self.score_callback(scores)
-            
-            # 更新總處理時間
-            self.total_processing_time += time.time() - frame_start_time
-            
-            return processed_frame, court_frame, detected_players
-            
+            cv2.imwrite(filename, frame)
+            return True
         except Exception as e:
-            print(f"[主進程] Pipeline 處理錯誤: {e}")
-            return None, None, None
+            print(f"儲存畫面錯誤: {e}")
+            return False
+
+    def get_player_statistics(self):
+        """獲取所有球員的統計資料"""
+        player_stats = {}
+        for player_key, registry_data in self.player_registry.items():
+            stats = {}
+            if player_key in self.player_states:
+                stats = self.player_states[player_key].copy()
+            track_id = registry_data.get('track_id', None)
+            if track_id in self.coordinate_mapper.tracking_data:
+                stats['total_distance'] = self.coordinate_mapper.tracking_data[track_id]['total_distance']
+
+            stats['last_seen'] = registry_data.get('last_seen', 0)
+            stats['team'] = registry_data.get('team', '')
+            stats['number'] = registry_data.get('number', '')
+            stats['stamina_color'] = self.get_stamina_color(stats.get('stamina', 100))
+            player_stats[player_key] = stats
+
+        return player_stats
+
+    def clear_trajectories(self):
+        """清除所有軌跡"""
+        self.coordinate_mapper.clear_trajectories()
+
+    def remove_trajectory(self, track_id):
+        """移除指定 track_id 的軌跡"""
+        self.coordinate_mapper.remove_trajectory(track_id)
+
+    def toggle_trajectory_display(self, show_trajectory=True):
+        """切換軌跡顯示"""
+        with self.lock:
+            self.display_options['trajectory'] = show_trajectory
+            if not show_trajectory:
+                self.clear_trajectories()
+
+    def reset_player_states(self):
+        """重置所有球員狀態"""
+        for player_key in self.player_states:
+            self.player_states[player_key] = {
+                'score': 0,
+                'stamina': 100,
+                'total_distance': 0
+            }
+        self.clear_trajectories()
+
+    def get_player_state(self, player_key):
+        """獲取特定球員的狀態"""
+        return self.player_states.get(player_key, {
+            'score': 0,
+            'stamina': 100,
+            'total_distance': 0
+        })
+
+    def update_player_state(self, player_key, state_updates):
+        """更新球員狀態"""
+        if player_key in self.player_states:
+            self.player_states[player_key].update(state_updates)
 
     def _create_mock_frame(self, text):
         """建立模擬的輸出畫面"""
@@ -1162,86 +1370,3 @@ class BasketballTracker:
                         detected_players.append(new_player)
 
         return detected_players
-
-    def reset_performance_metrics(self):
-        """重置性能指標"""
-        self.performance_metrics.clear()
-        self.total_frames_processed = 0
-        self.total_processing_time = 0
-
-    def reset_scores(self):
-        """重置所有得分"""
-        self.scoring_analyzer.reset_scores()
-        # 重置分數時也要通知更新
-        if self.score_callback:
-            self.score_callback(self.scoring_analyzer.get_scores())
-
-    def get_current_scores(self):
-        """獲取當前比分"""
-        return self.scoring_analyzer.get_scores()
-
-    def save_frame(self, frame, filename):
-        """儲存當前畫面"""
-        try:
-            cv2.imwrite(filename, frame)
-            return True
-        except Exception as e:
-            print(f"儲存畫面錯誤: {e}")
-            return False
-
-    def get_player_statistics(self):
-        """獲取所有球員的統計資料"""
-        player_stats = {}
-        for player_key, registry_data in self.player_registry.items():
-            stats = {}
-            if player_key in self.player_states:
-                stats = self.player_states[player_key].copy()
-            track_id = registry_data.get('track_id', None)
-            if track_id in self.coordinate_mapper.tracking_data:
-                stats['total_distance'] = self.coordinate_mapper.tracking_data[track_id]['total_distance']
-
-            stats['last_seen'] = registry_data.get('last_seen', 0)
-            stats['team'] = registry_data.get('team', '')
-            stats['number'] = registry_data.get('number', '')
-            stats['stamina_color'] = self.get_stamina_color(stats.get('stamina', 100))
-            player_stats[player_key] = stats
-
-        return player_stats
-
-    def clear_trajectories(self):
-        """清除所有軌跡"""
-        self.coordinate_mapper.clear_trajectories()
-
-    def remove_trajectory(self, track_id):
-        """移除指定 track_id 的軌跡"""
-        self.coordinate_mapper.remove_trajectory(track_id)
-
-    def toggle_trajectory_display(self, show_trajectory=True):
-        """切換軌跡顯示"""
-        with self.lock:
-            self.display_options['trajectory'] = show_trajectory
-            if not show_trajectory:
-                self.clear_trajectories()
-
-    def reset_player_states(self):
-        """重置所有球員狀態"""
-        for player_key in self.player_states:
-            self.player_states[player_key] = {
-                'score': 0,
-                'stamina': 100,
-                'total_distance': 0
-            }
-        self.clear_trajectories()
-
-    def get_player_state(self, player_key):
-        """獲取特定球員的狀態"""
-        return self.player_states.get(player_key, {
-            'score': 0,
-            'stamina': 100,
-            'total_distance': 0
-        })
-
-    def update_player_state(self, player_key, state_updates):
-        """更新球員狀態"""
-        if player_key in self.player_states:
-            self.player_states[player_key].update(state_updates)

@@ -29,9 +29,9 @@ def data_process_task(item_id, ocr_data):
 if __name__ == "__main__":
     # 1. 準備任務資料 (模擬 UI 輸入)
     items_to_process = [
-        ("item_A", "raw_data_A"),
-        ("item_B", "raw_data_B"),
-        ("item_C", "raw_data_C"),
+        ("frame_1", "raw_data_1"),
+        ("frame_2", "raw_data_2"),
+        ("frame_3", "raw_data_3"),
     ]
 
     all_final_results = []
@@ -60,4 +60,4 @@ if __name__ == "__main__":
         print(f"  {item_id}: {result}")
 
     total_time_estimate = len(items_to_process) * (2 + 3 + 1) # 每個物件的處理時間總和
-    print(f"\nEstimated total sequential processing time: {total_time_estimate} seconds (excluding print statements and overhead).")
+    print(f"\nEstimated total sequential processing time: {total_time_estimate} seconds.")

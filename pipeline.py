@@ -49,6 +49,7 @@ def data_process_task(item_id, ocr_data, previous_item_done_event=None):
 # --- Worker Process Functions ---
 def yolo_worker(input_q, output_q):
     set_process_name("YOLO_Worker")
+    print(f"[PID:{os.getpid()}] YOLO_Worker starting...")
     for item_id, data in iter(input_q.get, (None, None)): # (None,None) is a sentinel
         item_id_res, yolo_res = yolo_detection_task(item_id, data)
         output_q.put((item_id_res, yolo_res))
@@ -57,6 +58,7 @@ def yolo_worker(input_q, output_q):
 
 def ocr_worker(input_q, output_q):
     set_process_name("OCR_Worker")
+    print(f"[PID:{os.getpid()}] OCR_Worker starting...")
     for item_id, yolo_data in iter(input_q.get, (None, None)):
         item_id_res, ocr_res = ocr_detection_task(item_id, yolo_data)
         output_q.put((item_id_res, ocr_res))
@@ -65,6 +67,7 @@ def ocr_worker(input_q, output_q):
 
 def data_process_worker(input_q, output_q, item_completion_events):
     set_process_name("DataProcess_Worker")
+    print(f"[PID:{os.getpid()}] DataProcess_Worker starting...")
     # item_completion_events is a dictionary like:
     # { 'item_A_id': (None, current_item_event_to_set),
     #   'item_B_id': (event_for_A_to_wait_on, current_item_event_to_set),
@@ -93,18 +96,22 @@ if __name__ == "__main__":
     ocr_to_data_q = multiprocessing.Queue()
     final_output_q = multiprocessing.Queue() # 從 DataProcess 輸出結果
 
-    # 2. 準備任務資料 (模擬 UI 輸入)
-    # 假設我們有 item_A, item_B, item_C
-    # 為了方便，我們使用 item 的順序來命名，但在實際應用中，你可能會有唯一的 ID
+    # 2. 準備任務資料 (模擬 UI 輸入) - 修正為與 sequential 版本一致
     items_to_process = [
-        ("item_A", "raw_data_A"),
-        ("item_B", "raw_data_B"),
-        ("item_C", "raw_data_C"),
+        ("frame_1", "raw_data_1"),
+        ("frame_2", "raw_data_2"),
+        ("frame_3", "raw_data_3"),
     ]
 
+    all_final_results = []
+    print("Starting pipeline processing...\n")
+    
+    # 記錄開始時間
+    start_time = time.time()
+
     # 3. 建立同步事件 (用於 T3 的相依性)
-    # T3 for item_B waits for T3 for item_A to complete.
-    # T3 for item_C waits for T3 for item_B to complete.
+    # T3 for frame_2 waits for T3 for frame_1 to complete.
+    # T3 for frame_3 waits for T3 for frame_2 to complete.
     # `item_completion_events` maps an item_id to a tuple:
     # (event_this_item_waits_for, event_this_item_will_set_upon_completion)
     item_s3_events = {}
@@ -113,7 +120,6 @@ if __name__ == "__main__":
         current_item_event = multiprocessing.Event()
         item_s3_events[item_id] = (previous_item_event, current_item_event)
         previous_item_event = current_item_event
-
 
     # 4. 建立並啟動 Worker Processes
     yolo_proc = multiprocessing.Process(target=yolo_worker, args=(ui_to_yolo_q, yolo_to_ocr_q))
@@ -126,6 +132,7 @@ if __name__ == "__main__":
 
     # 5. 從 UI (模擬) 將任務放入第一個佇列
     for item_id, data in items_to_process:
+        print(f"--- Processing {item_id} ---")
         print(f"[MainProc] Sending {item_id} to pipeline.")
         ui_to_yolo_q.put((item_id, data))
         time.sleep(0.5) # 稍微錯開輸入，以便觀察 pipeline 效果
@@ -137,22 +144,34 @@ if __name__ == "__main__":
     results_count = 0
     while results_count < len(items_to_process):
         try:
-            item_id, final_result = final_output_q.get(timeout=10) # Timeout to prevent indefinite block
+            item_id, final_result = final_output_q.get(timeout=20) # 增加 timeout 時間
             if item_id is None: # Should not happen here if data_proc doesn't send sentinel
                 break
             print(f"[MainProc] Received final result for {item_id}: {final_result}")
+            print(f"--- Finished processing {item_id} ---\n")
+            all_final_results.append((item_id, final_result))
             results_count += 1
         except multiprocessing.queues.Empty:
             print("[MainProc] Timeout waiting for results. Processes might be stuck or finished.")
             break
 
-
     # 8. 等待所有 worker process 結束
     for w in workers:
-        w.join(timeout=10) # Add timeout to join
+        w.join(timeout=15) # 增加 timeout 時間
         if w.is_alive():
             print(f"[MainProc] Worker {w.name} (PID:{w.pid}) did not terminate gracefully. Terminating.")
             w.terminate() # Force terminate if join timed out
             w.join()
 
+    # 9. 顯示所有結果 - 與 sequential 版本一致的格式
+    print("\nAll items processed in pipeline. Final results:")
+    for item_id, result in all_final_results:
+        print(f"  {item_id}: {result}")
+    
+    # 計算實際處理時間
+    end_time = time.time()
+    actual_time = end_time - start_time
+    
+    print(f"\nActual pipeline processing time: {actual_time:.2f} seconds.")
+    print(f"Estimated pipeline processing benefits: Overlapped execution of T1, T2, T3 stages.")
     print("[MainProc] All tasks completed and processes joined.")

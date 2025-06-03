@@ -12,11 +12,12 @@ def main():
         os.makedirs(data_folder)
 
     try:
-        # 初始化追蹤器
+        # 初始化追蹤器（新增 max_parallel_frames 參數）
         tracker = BasketballTracker(
             player_model_path='best_demo_v2.pt',
             court_model_path='Court_best.pt',
-            data_folder=data_folder
+            data_folder=data_folder,
+            max_parallel_frames=3  # 新增：可調整的並行幀數（建議 2-4）
         )
         
         # 設置球場參考圖
@@ -24,13 +25,25 @@ def main():
 
         # 創建並啟動 Gradio 介面
         interface = GradioInterface(tracker)
+        
+        # 顯示 pipeline 狀態資訊
+        print(f"Pipeline 並行設定：最大 {tracker.max_parallel_frames} 個幀同時處理")
+        print("啟動 Gradio 介面...")
+        
         interface.launch()
 
     except Exception as e:
         print(f"程序運行時發生錯誤: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
+    # 設置多進程啟動方法（重要：避免衝突）
     if sys.platform.startswith('win') or sys.platform.startswith('darwin'):
-        try: mp.set_start_method('spawn', force=True)
-        except RuntimeError: print("警告: MP 'spawn' failed.")
+        try: 
+            mp.set_start_method('spawn', force=True)
+            print("設置多進程模式：spawn")
+        except RuntimeError: 
+            print("警告: MP 'spawn' 設置失敗，使用預設模式")
+    
     main()
