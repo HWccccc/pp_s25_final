@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 import torch
+import threading
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
 from paddleocr import PaddleOCR
 import pandas as pd
 import os
@@ -84,9 +86,7 @@ class BasketballTracker:
         # 座標映射相關
         self.court_image = None
         self.image_points = None
-        self.current_video_points = None
-
-        # 播放控制相關
+        self.current_video_points = None        # 播放控制相關
         self.is_playing = False
         self.video_capture = None
         self.current_frame = None
@@ -96,6 +96,16 @@ class BasketballTracker:
 
         # 新增得分回調
         self.score_callback = None
+        
+        # 設定輸出解析度
+        self.output_width = 640
+        self.output_height = 480
+        
+        # 初始化執行緒池
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        # 初始化 thread_local 存儲
+        self.thread_local = threading.local()
 
         # 設定輸出解析度
         self.output_width = 640
@@ -261,8 +271,7 @@ class BasketballTracker:
             'width': width,
             'height': height,
             'current_frame_index': self.current_frame_index
-        }
-
+        }    
     def set_frame_position(self, frame_number):
         """設置播放位置"""
         if self.video_capture is None:
@@ -275,7 +284,7 @@ class BasketballTracker:
             self.current_frame_index = frame_number
             return True
         return False
-
+        
     def release(self):
         """釋放資源"""
         if self.video_capture is not None:
@@ -286,6 +295,11 @@ class BasketballTracker:
         self.current_frame_index = 0
         self.is_playing = False
         self.coordinate_mapper.clear_trajectories()
+        
+        # 關閉執行緒池
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=True)
+            print("執行緒池已關閉")
 
     def update_player_stamina(self, player_key, distance):
         """更新球員體力值"""
@@ -332,12 +346,48 @@ class BasketballTracker:
         print("\nBreakdown by Steps:")
 
         for key, value in stats.items():
-            if key.endswith('_avg'):
+            if key.endswith('_avg'):                
                 step = key.replace('_avg', '')
                 print(f"\n{step}:")
                 print(f"  Average: {value * 1000:.2f} ms")
                 print(f"  Maximum: {stats[f'{step}_max'] * 1000:.2f} ms")
                 print(f"  Minimum: {stats[f'{step}_min'] * 1000:.2f} ms")
+                
+    def _get_player_model(self):
+        """獲取球員檢測模型的線程局部實例"""
+        if not hasattr(self.thread_local, 'player_model'):
+            print(f"線程 {threading.current_thread().name} 初始化球員模型")
+            self.thread_local.player_model = self.player_model
+        return self.thread_local.player_model
+    
+    def _get_court_model(self):
+        """獲取球場檢測模型的線程局部實例"""
+        if not hasattr(self.thread_local, 'court_model'):
+            print(f"線程 {threading.current_thread().name} 初始化球場模型")
+            self.thread_local.court_model = self.court_model
+        return self.thread_local.court_model
+        
+    def _detect_court(self, frame):
+        """球場檢測任務函數"""
+        model = self._get_court_model()
+        with torch.no_grad():
+            start = time.time()
+            result = model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+            elapsed = time.time() - start
+            print(f"球場檢測完成，耗時: {elapsed:.3f} 秒")
+            self.performance_metrics['court_detection'].append(elapsed)
+            return result
+    
+    def _detect_players(self, frame):
+        """球員檢測任務函數"""
+        model = self._get_player_model()
+        with torch.no_grad():
+            start = time.time()
+            result = model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+            elapsed = time.time() - start
+            print(f"球員檢測完成，耗時: {elapsed:.3f} 秒")
+            self.performance_metrics['player_detection'].append(elapsed)
+            return result
 
     def process_frame(self, frame):
         """處理單一幀"""
@@ -374,15 +424,18 @@ class BasketballTracker:
         hoop_data = None
         player_positions = {}
 
-        # 1) 處理球場檢測
+        # 使用 ThreadPoolExecutor 並行處理球場檢測和球員檢測
         start_time = time.time()
-        court_results = self.court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
-        self.performance_metrics['court_detection'].append(time.time() - start_time)
-
-        # 2) 處理球員、球、籃框等偵測
-        start_time = time.time()
-        player_results = self.player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
-        self.performance_metrics['player_detection'].append(time.time() - start_time)
+        # 提交檢測任務到執行緒池
+        court_future = self.executor.submit(self._detect_court, frame)
+        player_future = self.executor.submit(self._detect_players, frame)
+        
+        # 獲取檢測結果
+        court_results = court_future.result()
+        player_results = player_future.result()
+        
+        parallel_detection_time = time.time() - start_time
+        print(f"並行檢測總耗時: {parallel_detection_time:.3f} 秒")
 
         player_boxes = []
         team_boxes = []
@@ -791,4 +844,3 @@ class BasketballTracker:
         """更新球員狀態"""
         if player_key in self.player_states:
             self.player_states[player_key].update(state_updates)
-            11

@@ -14,7 +14,8 @@ import traceback
 import cv2
 import numpy as np
 import pandas as pd
-import multiprocessing as mp
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from models.basketball_tracker import BasketballTracker
 
 # --- VideoThread class remains the same ---
@@ -722,7 +723,4 @@ def main():
         traceback.print_exc()
 
 if __name__ == "__main__":
-    if sys.platform.startswith('win') or sys.platform.startswith('darwin'):
-        try: mp.set_start_method('spawn', force=True)
-        except RuntimeError: print("警告: MP 'spawn' failed.")
     main()
