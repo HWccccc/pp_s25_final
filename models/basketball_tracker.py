@@ -102,6 +102,90 @@ def process_court_model(frame, court_model_path, device):
     with torch.no_grad():
         return model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
 
+def ocr_pool_worker_process(args):
+    """OCR 池工作函式 - 處理單個 OCR 任務"""
+    frame_id, original_frame, number_boxes, player_boxes, team_boxes = args
+    
+    # 檢查是否已在這個進程中載入過 OCR 模型
+    if not hasattr(ocr_pool_worker_process, 'ocr_model'):
+        print(f"[OCR Pool] 進程 {os.getpid()} 載入 OCR 模型")
+        try:
+            from paddleocr import PaddleOCR
+            from .number_recognizer import NumberRecognizer
+            
+            ocr_pool_worker_process.ocr_model = PaddleOCR(
+                lang='en',
+                rec_model_dir="./path_to/en_PP-OCRv3_rec_infer", 
+                cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",
+                use_angle_cls=False,
+                use_gpu=True,
+                show_log=False
+            )
+            
+            ocr_pool_worker_process.number_recognizer = NumberRecognizer(ocr_pool_worker_process.ocr_model)
+            print(f"[OCR Pool] 進程 {os.getpid()} OCR 模型載入完成")
+            
+        except Exception as e:
+            print(f"[OCR Pool] 進程 {os.getpid()} OCR 初始化失敗: {e}")
+            ocr_pool_worker_process.ocr_model = None
+            ocr_pool_worker_process.number_recognizer = None
+    
+    # 使用載入的模型進行處理
+    if ocr_pool_worker_process.number_recognizer is None:
+        print(f"[OCR Pool] 進程 {os.getpid()} OCR 模型未載入，跳過處理")
+        return frame_id, []
+    
+    start_time = time.time()
+    ocr_matches = []
+    
+    try:
+        if number_boxes and original_frame is not None:
+            print(f"[OCR Pool] 進程 {os.getpid()} 處理 frame_{frame_id}，{len(number_boxes)} 個號碼區域")
+            
+            # ===== 格式轉換（與原本邏輯相同）=====
+            import torch
+            
+            class MockBox:
+                def __init__(self, data):
+                    self.xyxy = torch.tensor([[data['x1'], data['y1'], data['x2'], data['y2']]])
+                    self.cls = torch.tensor([data['cls']])
+                    self.id = torch.tensor([data['track_id']]) if data['track_id'] != -1 else None
+            
+            yolo_number_boxes = [MockBox(num_box) for num_box in number_boxes]
+            player_tuples = [(p['track_id'], p['x1'], p['y1'], p['x2'], p['y2']) for p in player_boxes]
+            team_tuples = [(t['x1'], t['y1'], t['x2'], t['y2'], t['team']) for t in team_boxes]
+            
+            # 使用 NumberRecognizer 處理
+            matches = ocr_pool_worker_process.number_recognizer.match_numbers_to_players(
+                original_frame, player_tuples, yolo_number_boxes, team_tuples
+            )
+            filtered_matches = ocr_pool_worker_process.number_recognizer.filter_matches(matches)
+            
+            # 轉換結果格式
+            for match in filtered_matches:
+                ocr_matches.append({
+                    'player_id': match.get('player_id'),
+                    'team': match.get('team'),
+                    'number': match.get('number'),
+                    'confidence': match.get('confidence', 1.0),
+                    'ocr_text': str(match.get('number', '')),
+                    'distance': match.get('distance', 0.0)
+                })
+                
+                print(f"[OCR Pool] 進程 {os.getpid()} 識別: #{match.get('number')} -> 球員ID {match.get('player_id')} 隊伍 {match.get('team')}")
+        
+        processing_time = time.time() - start_time
+        print(f"[OCR Pool] 進程 {os.getpid()} frame_{frame_id} 完成，耗時: {processing_time:.3f}s，識別 {len(ocr_matches)} 個號碼")
+        
+        return frame_id, ocr_matches
+        
+    except Exception as e:
+        print(f"[OCR Pool] 進程 {os.getpid()} 處理 frame_{frame_id} 錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        return frame_id, []
+
+
 # ===== Pipeline 階段處理 Workers =====
 def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_path, device):
     """Pipeline 階段1：模型推理 + 物件分類"""
@@ -227,177 +311,268 @@ def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_pat
             output_q.put((frame_id, results))
             print(f"[Pipeline階段1] 完成 frame_{frame_id}，分類: {len(player_boxes)}球員, {len(team_boxes)}隊伍, 球:{basketball_data is not None}, 籃框:{hoop_data is not None}")
 
-def pipeline_stage2_worker(input_q, output_q):
-    """Pipeline 階段2：OCR 號碼識別 - 使用NumberRecognizer邏輯"""
-    print("[Pipeline階段2] OCR 號碼識別 Worker 啟動...")
+# ===== OCR Worker 進程函數 =====
+def ocr_worker_process(worker_id, task_queue, result_queue):
+    """OCR 工作進程 - 預載入模型並持續處理任務"""
+    print(f"[OCR Worker {worker_id}] 進程啟動，PID: {os.getpid()}")
     
-    # 初始化 OCR 和 NumberRecognizer
-    from paddleocr import PaddleOCR
-    from .number_recognizer import NumberRecognizer
-    import cv2
-    import numpy as np
-    
+    # ===== 預載入 OCR 模型 =====
     try:
-        ocr = PaddleOCR(lang='en',
-                       rec_model_dir="./path_to/en_PP-OCRv3_rec_infer", 
-                       cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",
-                       use_angle_cls=False,
-                       use_gpu=True,
-                       show_log=False)
+        from paddleocr import PaddleOCR
+        from .number_recognizer import NumberRecognizer
         
-        # ===== 關鍵修改：加入NumberRecognizer =====
-        number_recognizer = NumberRecognizer(ocr)
-        print("[Pipeline階段2] OCR 模型和NumberRecognizer載入完成")
+        print(f"[OCR Worker {worker_id}] 開始載入 OCR 模型...")
+        
+        ocr_model = PaddleOCR(
+            lang='en',
+            rec_model_dir="./path_to/en_PP-OCRv3_rec_infer", 
+            cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",
+            use_angle_cls=False,
+            use_gpu=True,
+            show_log=False
+        )
+        
+        number_recognizer = NumberRecognizer(ocr_model)
+        print(f"[OCR Worker {worker_id}] OCR 模型載入完成")
         
     except Exception as e:
-        print(f"[Pipeline階段2] OCR 初始化失敗: {e}")
-        number_recognizer = None
+        print(f"[OCR Worker {worker_id}] OCR 初始化失敗: {e}")
+        return
     
+    print(f"[OCR Worker {worker_id}] 準備就緒，等待任務...")
+    
+    # ===== 持續處理任務 =====
     while True:
-        task = input_q.get()
-        if task is None:
-            print("[Pipeline階段2] 收到結束訊號")
-            output_q.put(None)
-            break
-        
-        frame_id, stage1_results = task
-        start_time = time.time()
-        
-        print(f"[Pipeline階段2] 處理 frame_{frame_id} OCR 號碼識別")
-        
-        # 提取資料
-        number_boxes = stage1_results.get('number_boxes', [])
-        player_boxes = stage1_results.get('player_boxes', [])
-        team_boxes = stage1_results.get('team_boxes', [])
-        original_frame = stage1_results.get('original_frame')
-        
-        ocr_matches = []
-        
-        if number_boxes and original_frame is not None and number_recognizer is not None:
-            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，使用NumberRecognizer處理")
+        try:
+            # 從任務佇列取得工作
+            task = task_queue.get()
+            
+            # 檢查結束訊號
+            if task is None:
+                print(f"[OCR Worker {worker_id}] 收到結束訊號")
+                break
+            
+            frame_id, original_frame, number_boxes, player_boxes, team_boxes = task
+            start_time = time.time()
+            ocr_matches = []
             
             try:
-                # ===== 修正格式轉換 =====
-                
-                # 1. 轉換number_boxes為YOLO格式（修正tensor格式）
-                yolo_number_boxes = []
-                for num_box in number_boxes:
-                    # 創建模擬YOLO box，使用numpy array模擬tensor
+                if number_boxes and original_frame is not None:
+                    print(f"[OCR Worker {worker_id}] 處理 frame_{frame_id}，{len(number_boxes)} 個號碼區域")
+                    
+                    # ===== 格式轉換 =====
                     import torch
                     
                     class MockBox:
                         def __init__(self, data):
-                            # 使用torch tensor格式，這樣有tolist()方法
                             self.xyxy = torch.tensor([[data['x1'], data['y1'], data['x2'], data['y2']]])
                             self.cls = torch.tensor([data['cls']])
                             self.id = torch.tensor([data['track_id']]) if data['track_id'] != -1 else None
                     
-                    yolo_number_boxes.append(MockBox(num_box))
-                
-                # 2. 轉換player_boxes為tuple格式
-                player_tuples = [(p['track_id'], p['x1'], p['y1'], p['x2'], p['y2']) for p in player_boxes]
-                
-                # 3. 轉換team_boxes為tuple格式  
-                team_tuples = [(t['x1'], t['y1'], t['x2'], t['y2'], t['team']) for t in team_boxes]
-                
-                print(f"[Pipeline階段2] 格式轉換完成: {len(yolo_number_boxes)}個號碼, {len(player_tuples)}個球員, {len(team_tuples)}個隊伍")
-                
-                # 4. 使用NumberRecognizer處理
-                matches = number_recognizer.match_numbers_to_players(
-                    original_frame, player_tuples, yolo_number_boxes, team_tuples
-                )
-                filtered_matches = number_recognizer.filter_matches(matches)
-                
-                # 5. 轉換結果格式
-                for match in filtered_matches:
-                    ocr_matches.append({
-                        'player_id': match.get('player_id'),
-                        'team': match.get('team'),
-                        'number': match.get('number'),
-                        'confidence': match.get('confidence', 1.0),
-                        'ocr_text': str(match.get('number', '')),
-                        'distance': match.get('distance', 0.0)
-                    })
+                    yolo_number_boxes = [MockBox(num_box) for num_box in number_boxes]
+                    player_tuples = [(p['track_id'], p['x1'], p['y1'], p['x2'], p['y2']) for p in player_boxes]
+                    team_tuples = [(t['x1'], t['y1'], t['x2'], t['y2'], t['team']) for t in team_boxes]
                     
-                    print(f"[Pipeline階段2] NumberRecognizer識別: #{match.get('number')} -> 球員ID {match.get('player_id')} 隊伍 {match.get('team')}")
+                    # 使用預載入的 NumberRecognizer 處理
+                    matches = number_recognizer.match_numbers_to_players(
+                        original_frame, player_tuples, yolo_number_boxes, team_tuples
+                    )
+                    filtered_matches = number_recognizer.filter_matches(matches)
+                    
+                    # 轉換結果格式
+                    for match in filtered_matches:
+                        ocr_matches.append({
+                            'player_id': match.get('player_id'),
+                            'team': match.get('team'),
+                            'number': match.get('number'),
+                            'confidence': match.get('confidence', 1.0),
+                            'ocr_text': str(match.get('number', '')),
+                            'distance': match.get('distance', 0.0)
+                        })
+                        
+                        print(f"[OCR Worker {worker_id}] 識別: #{match.get('number')} -> 球員ID {match.get('player_id')} 隊伍 {match.get('team')}")
                 
-                print(f"[Pipeline階段2] 成功識別 {len(ocr_matches)} 個號碼匹配")
+                processing_time = time.time() - start_time
+                print(f"[OCR Worker {worker_id}] frame_{frame_id} 完成，耗時: {processing_time:.3f}s，識別 {len(ocr_matches)} 個號碼")
+                
+                # 回傳結果
+                result_queue.put((frame_id, ocr_matches))
                 
             except Exception as e:
-                print(f"[Pipeline階段2] NumberRecognizer錯誤: {e}")
+                print(f"[OCR Worker {worker_id}] 處理 frame_{frame_id} 錯誤: {e}")
                 import traceback
                 traceback.print_exc()
+                result_queue.put((frame_id, []))
                 
-                # ===== 降級到簡化OCR處理 =====
-                print(f"[Pipeline階段2] 使用降級OCR處理")
-                try:
-                    for i, num_box in enumerate(number_boxes):
-                        x1, y1, x2, y2 = int(num_box['x1']), int(num_box['y1']), int(num_box['x2']), int(num_box['y2'])
-                        
-                        # 確保座標有效
-                        h, w = original_frame.shape[:2]
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(w, x2), min(h, y2)
-                        
-                        if x2 > x1 and y2 > y1:
-                            # 裁切號碼區域
-                            number_region = original_frame[y1:y2, x1:x2]
-                            
-                            # 進行OCR
-                            ocr_result = ocr.ocr(number_region, cls=False)
-                            
-                            if ocr_result and ocr_result[0]:
-                                for line in ocr_result[0]:
-                                    text = line[1][0]
-                                    confidence = line[1][1]
-                                    
-                                    if confidence > 0.3:
-                                        import re
-                                        numbers = re.findall(r'\d+', text)
-                                        if numbers:
-                                            number_text = numbers[0]
-                                            try:
-                                                number_value = int(number_text)
-                                                if 0 <= number_value <= 99:
-                                                    print(f"[Pipeline階段2] 降級OCR識別到號碼: {number_value}")
-                                                    # 簡單匹配到最近球員
-                                                    if player_boxes:
-                                                        closest_player = player_boxes[0]  # 簡化版
-                                                        closest_team = team_boxes[0]['team'] if team_boxes else 'unknown'
-                                                        
-                                                        ocr_matches.append({
-                                                            'player_id': closest_player['track_id'],
-                                                            'team': closest_team,
-                                                            'number': number_value,
-                                                            'confidence': confidence,
-                                                            'ocr_text': number_text,
-                                                            'distance': 50.0
-                                                        })
-                                            except ValueError:
-                                                continue
+        except Exception as e:
+            print(f"[OCR Worker {worker_id}] 任務處理錯誤: {e}")
+            break
+    
+    print(f"[OCR Worker {worker_id}] 進程結束")
+
+def pipeline_stage2_worker(input_q, output_q):
+    """修改版 Pipeline 階段2：使用 multiprocessing + Queue 的 OCR 處理"""
+    print("[Pipeline階段2] OCR multiprocessing + Queue Worker 啟動...")
+    
+    import multiprocessing as mp
+    import time
+    from collections import deque
+    
+    # ===== 建立 OCR 工作進程池 =====
+    max_workers = min(2, mp.cpu_count())
+    print(f"[Pipeline階段2] 啟動 {max_workers} 個 OCR 工作進程...")
+    
+    # 建立進程間通訊的 Queue
+    ctx = mp.get_context("spawn")
+    ocr_task_queue = ctx.Queue()
+    ocr_result_queue = ctx.Queue()
+    
+    # 啟動 OCR 工作進程
+    ocr_workers = []
+    for i in range(max_workers):
+        worker = ctx.Process(
+            target=ocr_worker_process,
+            args=(i, ocr_task_queue, ocr_result_queue)
+        )
+        worker.start()
+        ocr_workers.append(worker)
+        print(f"[Pipeline階段2] OCR Worker {i} 已啟動")
+    
+    # 等待所有 OCR 進程完成初始化
+    import time
+    print("[Pipeline階段2] 等待 OCR 工作進程完成模型載入...")
+    time.sleep(3)  # 給予足夠時間載入模型
+    print("[Pipeline階段2] OCR 工作進程已準備就緒")
+    
+    # ===== 任務處理邏輯 =====
+    pending_tasks = {}  # frame_id -> task_data
+    completed_results = {}  # frame_id -> ocr_results
+    task_counter = 0
+    
+    try:
+        while True:
+            # 1. 檢查是否有新的輸入任務
+            try:
+                task = input_q.get_nowait()
+                if task is None:
+                    print("[Pipeline階段2] 收到結束訊號")
+                    break
+                
+                frame_id, stage1_results = task
+                
+                # 提取 OCR 需要的資料
+                number_boxes = stage1_results.get('number_boxes', [])
+                player_boxes = stage1_results.get('player_boxes', [])
+                team_boxes = stage1_results.get('team_boxes', [])
+                original_frame = stage1_results.get('original_frame')
+                
+                if number_boxes and original_frame is not None:
+                    # 送給 OCR 工作進程
+                    ocr_task_queue.put((frame_id, original_frame, number_boxes, player_boxes, team_boxes))
+                    pending_tasks[frame_id] = stage1_results
+                    task_counter += 1
+                    print(f"[Pipeline階段2] 送出 frame_{frame_id} 給 OCR 工作進程，待處理: {len(pending_tasks)}")
+                else:
+                    # 沒有號碼需要處理，直接傳遞
+                    results = stage1_results.copy()
+                    results.update({
+                        'ocr_matches': [],
+                        'ocr_time': 0,
+                        'stage2_status': 'no_numbers'
+                    })
+                    output_q.put((frame_id, results))
+                    print(f"[Pipeline階段2] frame_{frame_id} 無號碼，直接傳遞")
                     
-                    print(f"[Pipeline階段2] 降級處理完成，識別 {len(ocr_matches)} 個號碼")
-                except Exception as fallback_error:
-                    print(f"[Pipeline階段2] 降級處理也失敗: {fallback_error}")
-                    ocr_matches = []
+            except:
+                pass  # 沒有新任務
+            
+            # 2. 檢查 OCR 結果
+            try:
+                result_frame_id, ocr_matches = ocr_result_queue.get_nowait()
+                completed_results[result_frame_id] = ocr_matches
+                print(f"[Pipeline階段2] 收到 frame_{result_frame_id} OCR 結果，識別 {len(ocr_matches)} 個號碼")
+            except:
+                pass  # 沒有新結果
+            
+            # 3. 處理完成的結果
+            completed_frames = []
+            for frame_id in list(pending_tasks.keys()):
+                if frame_id in completed_results:
+                    stage1_results = pending_tasks[frame_id]
+                    ocr_matches = completed_results[frame_id]
+                    
+                    # 組合最終結果
+                    results = stage1_results.copy()
+                    results.update({
+                        'ocr_matches': ocr_matches,
+                        'ocr_time': 0,
+                        'stage2_status': 'ocr_completed'
+                    })
+                    
+                    output_q.put((frame_id, results))
+                    print(f"[Pipeline階段2] 完成 frame_{frame_id}，識別 {len(ocr_matches)} 個號碼")
+                    
+                    completed_frames.append(frame_id)
+            
+            # 清理已完成的任務
+            for frame_id in completed_frames:
+                del pending_tasks[frame_id]
+                del completed_results[frame_id]
+            
+            # 避免 CPU 過度使用
+            if not pending_tasks and task_counter == 0:
+                time.sleep(0.001)
+        
+        # ===== 處理剩餘任務 =====
+        print(f"[Pipeline階段2] 等待剩餘 {len(pending_tasks)} 個任務完成...")
+        while pending_tasks:
+            try:
+                result_frame_id, ocr_matches = ocr_result_queue.get(timeout=10)
                 
-        elif number_boxes:
-            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，但缺少NumberRecognizer")
-        else:
-            print(f"[Pipeline階段2] 未找到號碼區域")
+                if result_frame_id in pending_tasks:
+                    stage1_results = pending_tasks[result_frame_id]
+                    
+                    results = stage1_results.copy()
+                    results.update({
+                        'ocr_matches': ocr_matches,
+                        'ocr_time': 0,
+                        'stage2_status': 'ocr_completed'
+                    })
+                    
+                    output_q.put((result_frame_id, results))
+                    print(f"[Pipeline階段2] 最終完成 frame_{result_frame_id}")
+                    
+                    del pending_tasks[result_frame_id]
+                    
+            except Exception as e:
+                print(f"[Pipeline階段2] 等待剩餘任務錯誤: {e}")
+                break
         
-        ocr_time = time.time() - start_time
+        # ===== 關閉 OCR 工作進程 =====
+        print("[Pipeline階段2] 關閉 OCR 工作進程...")
+        for i in range(max_workers):
+            ocr_task_queue.put(None)  # 發送結束訊號
         
-        # 傳遞結果
-        results = stage1_results.copy()
-        results.update({
-            'ocr_matches': ocr_matches,
-            'ocr_time': ocr_time,
-            'stage2_status': 'ocr_completed'
-        })
+        for worker in ocr_workers:
+            worker.join(timeout=5)
+            if worker.is_alive():
+                print(f"[Pipeline階段2] 強制終止 OCR Worker")
+                worker.terminate()
         
-        output_q.put((frame_id, results))
-        print(f"[Pipeline階段2] 完成 frame_{frame_id} OCR 處理，耗時: {ocr_time:.3f}s")
+        print("[Pipeline階段2] OCR 工作進程已關閉")
+        output_q.put(None)
+        
+    except Exception as e:
+        print(f"[Pipeline階段2] 錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 確保關閉所有進程
+        for worker in ocr_workers:
+            if worker.is_alive():
+                worker.terminate()
+        
+        output_q.put(None)
 
 def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
     """Pipeline 階段3：進籃分析 + 球場映射 + 狀態更新 + 畫面繪製 (必須按順序)"""
