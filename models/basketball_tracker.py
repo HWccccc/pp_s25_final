@@ -13,23 +13,105 @@ from .scoring_analyzer import ScoringAnalyzer
 from .coordinate_mapper import CoordinateMapper
 from utils.data_manager import DataManager
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 import multiprocessing as mp
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
-# ===== Pipeline 階段處理 Workers (保持原有不變) =====
+# ===== FPS 監控類別 =====
+class FPSMonitor:
+    def __init__(self, window_size=30):
+        self.window_size = window_size
+        self.frame_times = deque(maxlen=window_size)
+        self.last_time = time.time()
+        self.current_fps = 0.0
+        self.avg_fps = 0.0
+        
+    def update(self):
+        current_time = time.time()
+        frame_time = current_time - self.last_time
+        self.last_time = current_time
+        
+        if frame_time > 0:
+            self.current_fps = 1.0 / frame_time
+            self.frame_times.append(frame_time)
+            
+            if len(self.frame_times) > 0:
+                avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+                self.avg_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
+    
+    def get_fps(self):
+        return self.current_fps
+    
+    def get_avg_fps(self):
+        return self.avg_fps
+
+def draw_fps_on_frame(frame, fps_monitor):
+    """在影格上繪製 FPS 資訊"""
+    if frame is None:
+        return frame
+    
+    current_fps = fps_monitor.get_fps()
+    avg_fps = fps_monitor.get_avg_fps()
+    
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    color = (0, 255, 0)
+    thickness = 2
+    
+    fps_text = f"FPS: {current_fps:.1f}"
+    avg_fps_text = f"Avg: {avg_fps:.1f}"
+    
+    height, width = frame.shape[:2]
+    
+    # 繪製半透明背景
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (width - 150, 10), (width - 10, 80), (0, 0, 0), -1)
+    frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+    
+    # 繪製 FPS 文字
+    cv2.putText(frame, fps_text, (width - 140, 35), font, font_scale, color, thickness)
+    cv2.putText(frame, avg_fps_text, (width - 140, 60), font, font_scale, color, thickness)
+    
+    return frame
+
+# ===== ThreadPool 模型管理函數（移到最外層）=====
+# 全局的 thread_local 存儲
+_thread_local = threading.local()
+
+def get_player_model(player_model_path, device):
+    if not hasattr(_thread_local, 'player_model'):
+        print(f"[Pipeline階段1] 載入球員模型到線程 {threading.current_thread().ident}")
+        _thread_local.player_model = YOLO(player_model_path).to(device)
+    return _thread_local.player_model
+    
+def get_court_model(court_model_path, device):
+    if not hasattr(_thread_local, 'court_model'):
+        print(f"[Pipeline階段1] 載入球場模型到線程 {threading.current_thread().ident}")
+        _thread_local.court_model = YOLO(court_model_path).to(device)
+    return _thread_local.court_model
+
+def process_player_model(frame, player_model_path, device):
+    model = get_player_model(player_model_path, device)
+    with torch.no_grad():
+        return model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+
+def process_court_model(frame, court_model_path, device):
+    model = get_court_model(court_model_path, device)
+    with torch.no_grad():
+        return model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+
+# ===== Pipeline 階段處理 Workers =====
 def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_path, device):
     """Pipeline 階段1：模型推理 + 物件分類"""
     print("[Pipeline階段1] 模型推理 + 物件分類 Worker 啟動...")
     
-    # 載入模型
-    player_model = YOLO(player_model_path).to(device)
-    court_model = YOLO(court_model_path).to(device)
-    
     # 類別映射
     team_mapping = {0: '3-s', 2: 'biv'}
     
-    with torch.no_grad():
+    # 使用 ThreadPoolExecutor 進行並行推理
+    with ThreadPoolExecutor(max_workers=2) as executor:
         while True:
             task = input_q.get()
             if task is None:
@@ -40,9 +122,13 @@ def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_pat
             frame_id, frame = task
             start_time = time.time()
             
-            # 執行實際的 YOLO 推理
-            player_results = player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
-            court_results = court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+            # 並行執行兩個模型的推理
+            player_future = executor.submit(process_player_model, frame, player_model_path, device)
+            court_future = executor.submit(process_court_model, frame, court_model_path, device)
+            
+            # 等待兩個推理結果
+            player_results = player_future.result()
+            court_results = court_future.result()
             
             # 初始化分類結果
             player_boxes = []
@@ -312,6 +398,9 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
         color = tuple(np.random.randint(0, 255, size=3).tolist())
         return color
     
+    # 初始化 FPS 監控器（在 Worker 中使用）
+    fps_monitor = FPSMonitor(window_size=30)
+    
     while True:
         task = input_q.get()
         if task is None:
@@ -320,6 +409,9 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             break
         
         frame_id, stage2_results = task
+        
+        # 更新 FPS 計算
+        fps_monitor.update()
         
         # 等待前一幀完成 (保持時序)
         previous_event, current_event = frame_completion_events.get(frame_id, (None, None))
@@ -417,9 +509,6 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
         # === 4. 處理 OCR 號碼匹配結果 ===
         if ocr_matches:
             print(f"[Pipeline階段3] 處理 {len(ocr_matches)} 個 OCR 號碼匹配")
-            # 這裡需要更新球員註冊表和關聯
-            # 但由於我們在 Worker 中，無法直接存取主進程的 player_registry
-            # 暫時先記錄，或者考慮其他方式同步
             for match in ocr_matches:
                 print(f"[Pipeline階段3] 識別到球員: ID {match['player_id']}, 隊伍 {match['team']}, 號碼 {match['number']}")
         
@@ -509,6 +598,9 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
                 cv2.putText(processed_frame, "HOOP", (x1, y1 - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         
+        # ===== 繪製 FPS 資訊到影片上 =====
+        processed_frame = draw_fps_on_frame(processed_frame, fps_monitor)
+        
         # 縮放球場畫面
         if court_frame is not None:
             court_frame = cv2.resize(court_frame, (output_width, output_height))
@@ -541,6 +633,10 @@ class BasketballTracker:
         # 儲存模型路徑（用於多進程）
         self.player_model_path = player_model_path
         self.court_model_path = court_model_path
+
+        # ===== 新增：FPS 監控 =====
+        self.fps_monitor = FPSMonitor(window_size=30)
+        self.show_fps = True  # 控制是否顯示 FPS
 
         # ===== 新增：並行控制參數 =====
         self.max_parallel_frames = max_parallel_frames
@@ -682,6 +778,9 @@ class BasketballTracker:
         if frame is None:
             return None, None, None
 
+        # 更新 FPS 計算
+        self.fps_monitor.update()
+
         frame_start_time = time.time()
         self.frame_count += 1
         self.total_frames_processed += 1
@@ -807,6 +906,7 @@ class BasketballTracker:
         self.frame_completion_events.clear()
         self.previous_frame_event = None
         self.frame_count = 0
+        self.fps_monitor = FPSMonitor(window_size=30)  # 重置 FPS 監控
 
     def get_pipeline_status(self):
         """取得 pipeline 狀態資訊"""
@@ -815,9 +915,23 @@ class BasketballTracker:
             'pending_results_count': len(self.pending_results),
             'next_expected_frame': self.next_expected_frame,
             'max_parallel_frames': self.max_parallel_frames,
-            'current_frame_count': self.frame_count
+            'current_frame_count': self.frame_count,
+            'current_fps': self.fps_monitor.get_fps(),
+            'avg_fps': self.fps_monitor.get_avg_fps()
         }
 
+    def toggle_fps_display(self, show_fps=True):
+        """切換 FPS 顯示開關"""
+        self.show_fps = show_fps
+
+    def get_fps_info(self):
+        """獲取 FPS 資訊"""
+        return {
+            'current_fps': self.fps_monitor.get_fps(),
+            'avg_fps': self.fps_monitor.get_avg_fps()
+        }
+
+    # 以下保持原有的所有其他方法不變...
     def get_player_info(self, team, number):
         """從DataManager獲取球員信息"""
         player_data, error = self.data_manager.get_player_data(team, number)
@@ -882,9 +996,6 @@ class BasketballTracker:
             [853, 567]  # bottom_right
         ], dtype=np.float32)
         self.coordinate_mapper.set_reference(court_image_path, self.image_points)
-        
-        # 更新 Stage3 的球場設定 (需要重新啟動 Stage3 進程)
-        # 暫時先不動態更新，等架構穩定後再優化
 
     def update_display_options(self, player=True, ball=True, team=True, number=True, trajectory=True):
         """更新顯示選項"""
@@ -1051,6 +1162,7 @@ class BasketballTracker:
         self.is_playing = False
         self.coordinate_mapper.clear_trajectories()
 
+    # 其他所有原有方法保持不變...
     def update_player_stamina(self, player_key, distance):
         """更新球員體力值"""
         if player_key in self.player_states:
@@ -1073,7 +1185,9 @@ class BasketballTracker:
             "total_frames": self.total_frames_processed,
             "total_time": self.total_processing_time,
             "avg_time_per_frame": self.total_processing_time / max(1, self.total_frames_processed),
-            "fps": self.total_frames_processed / max(0.001, self.total_processing_time)
+            "fps": self.total_frames_processed / max(0.001, self.total_processing_time),
+            "current_fps": self.fps_monitor.get_fps(),
+            "avg_fps": self.fps_monitor.get_avg_fps()
         }
 
         # 計算每個步驟的平均時間
@@ -1093,6 +1207,8 @@ class BasketballTracker:
         print(f"Total Processing Time: {stats['total_time']:.2f} seconds")
         print(f"Average Time per Frame: {stats['avg_time_per_frame'] * 1000:.2f} ms")
         print(f"Average FPS: {stats['fps']:.2f}")
+        print(f"Current FPS: {stats['current_fps']:.2f}")
+        print(f"Average FPS (Window): {stats['avg_fps']:.2f}")
         print("\nBreakdown by Steps:")
 
         for key, value in stats.items():
@@ -1108,6 +1224,7 @@ class BasketballTracker:
         self.performance_metrics.clear()
         self.total_frames_processed = 0
         self.total_processing_time = 0
+        self.fps_monitor = FPSMonitor(window_size=30)
 
     def reset_scores(self):
         """重置所有得分"""
