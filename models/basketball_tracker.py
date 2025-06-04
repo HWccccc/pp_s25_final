@@ -228,24 +228,30 @@ def pipeline_stage1_worker(input_q, output_q, player_model_path, court_model_pat
             print(f"[Pipeline階段1] 完成 frame_{frame_id}，分類: {len(player_boxes)}球員, {len(team_boxes)}隊伍, 球:{basketball_data is not None}, 籃框:{hoop_data is not None}")
 
 def pipeline_stage2_worker(input_q, output_q):
-    """Pipeline 階段2：OCR 號碼識別"""
+    """Pipeline 階段2：OCR 號碼識別 - 使用NumberRecognizer邏輯"""
     print("[Pipeline階段2] OCR 號碼識別 Worker 啟動...")
     
-    # 初始化 OCR
+    # 初始化 OCR 和 NumberRecognizer
     from paddleocr import PaddleOCR
     from .number_recognizer import NumberRecognizer
     import cv2
     import numpy as np
     
-    ocr = PaddleOCR(lang='en',
-                   rec_model_dir="./path_to/en_PP-OCRv3_rec_infer", 
-                   cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",
-                   use_angle_cls=False,
-                   use_gpu=True,
-                   show_log=False)
-    
-    number_recognizer = NumberRecognizer(ocr)
-    print("[Pipeline階段2] OCR 模型載入完成")
+    try:
+        ocr = PaddleOCR(lang='en',
+                       rec_model_dir="./path_to/en_PP-OCRv3_rec_infer", 
+                       cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",
+                       use_angle_cls=False,
+                       use_gpu=True,
+                       show_log=False)
+        
+        # ===== 關鍵修改：加入NumberRecognizer =====
+        number_recognizer = NumberRecognizer(ocr)
+        print("[Pipeline階段2] OCR 模型和NumberRecognizer載入完成")
+        
+    except Exception as e:
+        print(f"[Pipeline階段2] OCR 初始化失敗: {e}")
+        number_recognizer = None
     
     while True:
         task = input_q.get()
@@ -259,7 +265,7 @@ def pipeline_stage2_worker(input_q, output_q):
         
         print(f"[Pipeline階段2] 處理 frame_{frame_id} OCR 號碼識別")
         
-        # 提取號碼識別需要的資料
+        # 提取資料
         number_boxes = stage1_results.get('number_boxes', [])
         player_boxes = stage1_results.get('player_boxes', [])
         team_boxes = stage1_results.get('team_boxes', [])
@@ -267,90 +273,122 @@ def pipeline_stage2_worker(input_q, output_q):
         
         ocr_matches = []
         
-        if number_boxes and original_frame is not None:
-            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，開始 OCR 識別")
+        if number_boxes and original_frame is not None and number_recognizer is not None:
+            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，使用NumberRecognizer處理")
             
             try:
-                # 簡化版本：直接對號碼區域進行 OCR
-                for i, num_box in enumerate(number_boxes):
-                    x1, y1, x2, y2 = int(num_box['x1']), int(num_box['y1']), int(num_box['x2']), int(num_box['y2'])
+                # ===== 修正格式轉換 =====
+                
+                # 1. 轉換number_boxes為YOLO格式（修正tensor格式）
+                yolo_number_boxes = []
+                for num_box in number_boxes:
+                    # 創建模擬YOLO box，使用numpy array模擬tensor
+                    import torch
                     
-                    # 確保座標在有效範圍內
-                    h, w = original_frame.shape[:2]
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
+                    class MockBox:
+                        def __init__(self, data):
+                            # 使用torch tensor格式，這樣有tolist()方法
+                            self.xyxy = torch.tensor([[data['x1'], data['y1'], data['x2'], data['y2']]])
+                            self.cls = torch.tensor([data['cls']])
+                            self.id = torch.tensor([data['track_id']]) if data['track_id'] != -1 else None
                     
-                    if x2 > x1 and y2 > y1:
-                        # 裁切號碼區域
-                        number_region = original_frame[y1:y2, x1:x2]
-                        
-                        # 進行 OCR 識別
-                        ocr_result = ocr.ocr(number_region, cls=False)
-                        
-                        if ocr_result and ocr_result[0]:
-                            for line in ocr_result[0]:
-                                text = line[1][0]
-                                confidence = line[1][1]
-                                
-                                # 檢查是否為數字
-                                if text.isdigit() and confidence > 0.5:
-                                    # 尋找最近的球員
-                                    min_dist = float('inf')
-                                    closest_player = None
-                                    num_center_x = (x1 + x2) / 2
-                                    num_center_y = (y1 + y2) / 2
-                                    
-                                    for player_box in player_boxes:
-                                        px1, py1, px2, py2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
-                                        player_center_x = (px1 + px2) / 2
-                                        player_center_y = (py1 + py2) / 2
-                                        
-                                        dist = ((num_center_x - player_center_x) ** 2 + (num_center_y - player_center_y) ** 2) ** 0.5
-                                        if dist < min_dist:
-                                            min_dist = dist
-                                            closest_player = player_box
-                                    
-                                    # 尋找最近的隊伍
-                                    closest_team = "unknown"
-                                    min_team_dist = float('inf')
-                                    for team_box in team_boxes:
-                                        tx1, ty1, tx2, ty2 = team_box['x1'], team_box['y1'], team_box['x2'], team_box['y2']
-                                        team_center_x = (tx1 + tx2) / 2
-                                        team_center_y = (ty1 + ty2) / 2
-                                        
-                                        dist = ((num_center_x - team_center_x) ** 2 + (num_center_y - team_center_y) ** 2) ** 0.5
-                                        if dist < min_team_dist:
-                                            min_team_dist = dist
-                                            closest_team = team_box['team']
-                                    
-                                    if closest_player and min_dist < 100:  # 距離閾值
-                                        ocr_matches.append({
-                                            'player_id': closest_player['track_id'],
-                                            'team': closest_team,
-                                            'number': int(text),
-                                            'confidence': confidence,
-                                            'ocr_text': text,
-                                            'distance': min_dist
-                                        })
-                                        
-                                        print(f"[Pipeline階段2] 識別號碼: {text} (信心度: {confidence:.2f}) -> 球員ID {closest_player['track_id']} 隊伍 {closest_team}")
+                    yolo_number_boxes.append(MockBox(num_box))
+                
+                # 2. 轉換player_boxes為tuple格式
+                player_tuples = [(p['track_id'], p['x1'], p['y1'], p['x2'], p['y2']) for p in player_boxes]
+                
+                # 3. 轉換team_boxes為tuple格式  
+                team_tuples = [(t['x1'], t['y1'], t['x2'], t['y2'], t['team']) for t in team_boxes]
+                
+                print(f"[Pipeline階段2] 格式轉換完成: {len(yolo_number_boxes)}個號碼, {len(player_tuples)}個球員, {len(team_tuples)}個隊伍")
+                
+                # 4. 使用NumberRecognizer處理
+                matches = number_recognizer.match_numbers_to_players(
+                    original_frame, player_tuples, yolo_number_boxes, team_tuples
+                )
+                filtered_matches = number_recognizer.filter_matches(matches)
+                
+                # 5. 轉換結果格式
+                for match in filtered_matches:
+                    ocr_matches.append({
+                        'player_id': match.get('player_id'),
+                        'team': match.get('team'),
+                        'number': match.get('number'),
+                        'confidence': match.get('confidence', 1.0),
+                        'ocr_text': str(match.get('number', '')),
+                        'distance': match.get('distance', 0.0)
+                    })
+                    
+                    print(f"[Pipeline階段2] NumberRecognizer識別: #{match.get('number')} -> 球員ID {match.get('player_id')} 隊伍 {match.get('team')}")
                 
                 print(f"[Pipeline階段2] 成功識別 {len(ocr_matches)} 個號碼匹配")
                 
             except Exception as e:
-                print(f"[Pipeline階段2] OCR 識別錯誤: {e}")
+                print(f"[Pipeline階段2] NumberRecognizer錯誤: {e}")
                 import traceback
                 traceback.print_exc()
-                ocr_matches = []
-        
+                
+                # ===== 降級到簡化OCR處理 =====
+                print(f"[Pipeline階段2] 使用降級OCR處理")
+                try:
+                    for i, num_box in enumerate(number_boxes):
+                        x1, y1, x2, y2 = int(num_box['x1']), int(num_box['y1']), int(num_box['x2']), int(num_box['y2'])
+                        
+                        # 確保座標有效
+                        h, w = original_frame.shape[:2]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        
+                        if x2 > x1 and y2 > y1:
+                            # 裁切號碼區域
+                            number_region = original_frame[y1:y2, x1:x2]
+                            
+                            # 進行OCR
+                            ocr_result = ocr.ocr(number_region, cls=False)
+                            
+                            if ocr_result and ocr_result[0]:
+                                for line in ocr_result[0]:
+                                    text = line[1][0]
+                                    confidence = line[1][1]
+                                    
+                                    if confidence > 0.3:
+                                        import re
+                                        numbers = re.findall(r'\d+', text)
+                                        if numbers:
+                                            number_text = numbers[0]
+                                            try:
+                                                number_value = int(number_text)
+                                                if 0 <= number_value <= 99:
+                                                    print(f"[Pipeline階段2] 降級OCR識別到號碼: {number_value}")
+                                                    # 簡單匹配到最近球員
+                                                    if player_boxes:
+                                                        closest_player = player_boxes[0]  # 簡化版
+                                                        closest_team = team_boxes[0]['team'] if team_boxes else 'unknown'
+                                                        
+                                                        ocr_matches.append({
+                                                            'player_id': closest_player['track_id'],
+                                                            'team': closest_team,
+                                                            'number': number_value,
+                                                            'confidence': confidence,
+                                                            'ocr_text': number_text,
+                                                            'distance': 50.0
+                                                        })
+                                            except ValueError:
+                                                continue
+                    
+                    print(f"[Pipeline階段2] 降級處理完成，識別 {len(ocr_matches)} 個號碼")
+                except Exception as fallback_error:
+                    print(f"[Pipeline階段2] 降級處理也失敗: {fallback_error}")
+                    ocr_matches = []
+                
         elif number_boxes:
-            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，但缺少原始幀")
+            print(f"[Pipeline階段2] 找到 {len(number_boxes)} 個號碼區域，但缺少NumberRecognizer")
         else:
             print(f"[Pipeline階段2] 未找到號碼區域")
         
         ocr_time = time.time() - start_time
         
-        # 將 OCR 結果加入 stage1 結果中，保持原始幀傳遞
+        # 傳遞結果
         results = stage1_results.copy()
         results.update({
             'ocr_matches': ocr_matches,
@@ -368,6 +406,7 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
     # 初始化分析器 (在 Worker 內部建立)
     from .scoring_analyzer import ScoringAnalyzer
     from .coordinate_mapper import CoordinateMapper
+    from .court_analyzer import extract_geometric_points  # ===== 新增 =====
     import cv2
     import numpy as np
     
@@ -379,6 +418,16 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
     output_height = config['output_height']
     class_names = config['class_names']
     team_mapping = config['team_mapping']
+    
+    # ===== 新增：class_display 映射 =====
+    class_display = {
+        0: "3-s",    # 3-s -> 3fm
+        1: "ball",
+        2: "biv",    # biv -> b
+        3: "hoop",
+        4: "Num",    # number -> N
+        5: "Player"  # player -> P
+    }
     
     # 球場相關設定
     court_image = None
@@ -401,6 +450,12 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
     # 初始化 FPS 監控器（在 Worker 中使用）
     fps_monitor = FPSMonitor(window_size=30)
     
+    # ===== 新增：模擬 display_options 和 player_associations =====
+    display_options = {'player': True, 'ball': True, 'team': True, 'number': True, 'trajectory': True}
+    player_associations = {}  # track_id -> player_key
+    player_registry = {}     # player_key -> {team, number, track_id, last_seen}
+    frame_count = 0
+    
     while True:
         task = input_q.get()
         if task is None:
@@ -409,6 +464,7 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             break
         
         frame_id, stage2_results = task
+        frame_count = frame_id  # 更新幀計數
         
         # 更新 FPS 計算
         fps_monitor.update()
@@ -431,7 +487,38 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
         ocr_matches = stage2_results.get('ocr_matches', [])
         original_frame = stage2_results.get('original_frame')  # 需要從 stage1 傳遞原始幀
         
-        # === 1. 進籃分析 ===
+        # ===== 新增：構建 player_positions =====
+        player_positions = {}
+        for player_box in player_boxes:
+            track_id = player_box['track_id']
+            x1, y1, x2, y2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
+            
+            # 確定球員所屬隊伍
+            team = None
+            if track_id in player_associations:
+                player_key = player_associations[track_id]
+                if player_key in player_registry:
+                    team = player_registry[player_key]['team']
+            
+            if not team:
+                # 從最近的team_box推斷隊伍
+                min_dist = float('inf')
+                player_center_x = (x1 + x2) / 2
+                player_center_y = (y1 + y2) / 2
+                
+                for team_box in team_boxes:
+                    tx1, ty1, tx2, ty2 = team_box['x1'], team_box['y1'], team_box['x2'], team_box['y2']
+                    team_center_x = (tx1 + tx2) / 2
+                    team_center_y = (ty1 + ty2) / 2
+                    
+                    dist = ((player_center_x - team_center_x) ** 2 + (player_center_y - team_center_y) ** 2) ** 0.5
+                    if dist < min_dist:
+                        min_dist = dist
+                        team = team_box['team']
+            
+            player_positions[track_id] = (x1, y1, x2, y2, team or 'unknown')
+        
+        # === 1. 進籃分析（補充 update_last_touch）===
         scores_updated = False
         if basketball_data and hoop_data:
             # 轉換資料格式為原本的 tuple 格式
@@ -439,6 +526,10 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             hoop_tuple = (hoop_data['center'], hoop_data['left'], hoop_data['right'])
             
             scoring_analyzer.update_positions(ball_tuple, hoop_tuple)
+            
+            # ===== 新增：update_last_touch 調用 =====
+            if basketball_data['center']:
+                scoring_analyzer.update_last_touch(basketball_data['center'], player_positions)
             
             # 檢查得分
             scored, team = scoring_analyzer.check_scoring(basketball_data['center'], hoop_data['center'])
@@ -451,22 +542,43 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             predicted_pos = scoring_analyzer.predict_basketball_position()
             if predicted_pos:
                 basketball_data = {'center': predicted_pos, 'left': None, 'right': None}
+                # 對預測位置也更新 last_touch
+                scoring_analyzer.update_last_touch(predicted_pos, player_positions)
         
-        # === 2. 球場映射與軌跡 ===
+        # === 2. 球場映射與軌跡（補充 masks 處理）===
         court_frame = None
         if court_image is not None:
             court_frame = court_image.copy()
             
-            # 處理球場映射
+            # ===== 修正：使用 masks 進行精確球場映射 =====
             current_video_points = None
             for court_box in court_boxes:
-                if court_box['cls'] == 1:  # RA area (假設)
-                    # 這裡需要 extract_geometric_points 邏輯
-                    # 暫時用簡化版本
+                if court_box['cls'] == 1:  # RA area
+                    # 檢查是否有 masks 資訊（從 court model results）
+                    # 如果沒有 masks，使用 box 座標作為替代
                     x1, y1, x2, y2 = court_box['x1'], court_box['y1'], court_box['x2'], court_box['y2']
-                    current_video_points = np.array([
-                        [x1, y1], [x1, y2], [x2, y1], [x2, y2]
+                    
+                    # 簡化版本：使用 box 四個角點作為映射點
+                    mask_points = np.array([
+                        [x1, y1], [x2, y1], [x2, y2], [x1, y2]
                     ], dtype=np.float32)
+                    
+                    try:
+                        # 嘗試使用 extract_geometric_points（如果可用）
+                        geometric_points = extract_geometric_points(mask_points)
+                        if "RA" in geometric_points and "points" in geometric_points["RA"]:
+                            current_video_points = np.array([
+                                geometric_points["RA"]["points"][0],
+                                geometric_points["RA"]["points"][1],
+                                geometric_points["RA"]["points"][2],
+                                geometric_points["RA"]["points"][3]
+                            ], dtype=np.float32)
+                        else:
+                            current_video_points = mask_points
+                    except:
+                        # 降級使用 box 座標
+                        current_video_points = mask_points
+                    
                     break
             
             # 處理球員軌跡
@@ -506,13 +618,33 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
                 except Exception as e:
                     print(f"[Pipeline階段3] 球場映射錯誤: {e}")
         
-        # === 4. 處理 OCR 號碼匹配結果 ===
+        # ===== 新增：處理 OCR 號碼匹配結果（更新 player_associations）=====
         if ocr_matches:
             print(f"[Pipeline階段3] 處理 {len(ocr_matches)} 個 OCR 號碼匹配")
             for match in ocr_matches:
-                print(f"[Pipeline階段3] 識別到球員: ID {match['player_id']}, 隊伍 {match['team']}, 號碼 {match['number']}")
+                track_id = match['player_id']
+                team = match['team']
+                number = match['number']
+                player_key = f"{team}_{number}"
+                
+                # 更新 player_registry
+                if player_key not in player_registry:
+                    player_registry[player_key] = {
+                        "team": team,
+                        "number": number,
+                        "track_id": track_id,
+                        "last_seen": frame_count
+                    }
+                else:
+                    player_registry[player_key]['track_id'] = track_id
+                    player_registry[player_key]['last_seen'] = frame_count
+                
+                # 更新 player_associations
+                player_associations[track_id] = player_key
+                
+                print(f"[Pipeline階段3] 識別到球員: ID {track_id}, 隊伍 {team}, 號碼 {number}")
         
-        # === 3. 畫面繪製 ===
+        # === 3. 畫面繪製（加入 display_options 控制）===
         # 使用原始影片作為底圖，如果沒有就建立黑色畫面
         if original_frame is not None:
             processed_frame = original_frame.copy()
@@ -522,8 +654,8 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             # 如果沒有原始幀，建立黑色畫面
             processed_frame = np.zeros((output_height, output_width, 3), dtype=np.uint8)
         
-        # 繪製籃球
-        if basketball_data and basketball_data['center']:
+        # 繪製籃球（基於 display_options）
+        if display_options['ball'] and basketball_data and basketball_data['center']:
             center = basketball_data['center']
             left = basketball_data['left']
             right = basketball_data['right']
@@ -538,49 +670,55 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
                 cv2.putText(processed_frame, "BALL", (x1, y1 - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
-        # 繪製球員
-        for player_box in player_boxes:
-            track_id = player_box['track_id']
-            x1, y1, x2, y2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
-            
-            # 調整座標到輸出尺寸
-            if original_frame is not None:
-                x1 = int(x1 * output_width / original_frame.shape[1])
-                y1 = int(y1 * output_height / original_frame.shape[0])
-                x2 = int(x2 * output_width / original_frame.shape[1])
-                y2 = int(y2 * output_height / original_frame.shape[0])
-            
-            color = get_color_from_id(track_id)
-            
-            # 檢查是否有對應的 OCR 識別結果
-            player_label = f"Player {track_id}"
-            for match in ocr_matches:
-                if match['player_id'] == track_id:
-                    player_label = f"{match['team']} #{match['number']}"
-                    break
-            
-            cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            cv2.putText(processed_frame, player_label,
-                       (int(x1), int(y1) - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # 繪製球員（基於 display_options 和 player_associations）
+        if display_options['player']:
+            for player_box in player_boxes:
+                track_id = player_box['track_id']
+                x1, y1, x2, y2 = player_box['x1'], player_box['y1'], player_box['x2'], player_box['y2']
+                
+                # 調整座標到輸出尺寸
+                if original_frame is not None:
+                    x1 = int(x1 * output_width / original_frame.shape[1])
+                    y1 = int(y1 * output_height / original_frame.shape[0])
+                    x2 = int(x2 * output_width / original_frame.shape[1])
+                    y2 = int(y2 * output_height / original_frame.shape[0])
+                
+                color = get_color_from_id(track_id)
+                
+                # ===== 新增：檢查 player_associations 來顯示球員標籤 =====
+                if track_id in player_associations:
+                    player_key = player_associations[track_id]
+                    if player_key in player_registry:
+                        assoc_data = player_registry[player_key]
+                        player_label = f"{class_display[5]} {assoc_data['team']}#{assoc_data['number']}"
+                    else:
+                        player_label = f"{class_display[5]} {track_id}"
+                else:
+                    player_label = f"{class_display[5]} {track_id}"
+                
+                cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv2.putText(processed_frame, player_label,
+                           (int(x1), int(y1) - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # 繪製隊伍
-        for team_box in team_boxes:
-            x1, y1, x2, y2 = team_box['x1'], team_box['y1'], team_box['x2'], team_box['y2']
-            team = team_box['team']
-            
-            # 調整座標到輸出尺寸
-            if original_frame is not None:
-                x1 = int(x1 * output_width / original_frame.shape[1])
-                y1 = int(y1 * output_height / original_frame.shape[0])
-                x2 = int(x2 * output_width / original_frame.shape[1])
-                y2 = int(y2 * output_height / original_frame.shape[0])
-            
-            color = (255, 0, 0) if team == '3-s' else (0, 0, 255)
-            
-            cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            cv2.putText(processed_frame, team, (int(x1), int(y1) - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # 繪製隊伍（基於 display_options）
+        if display_options['team']:
+            for team_box in team_boxes:
+                x1, y1, x2, y2 = team_box['x1'], team_box['y1'], team_box['x2'], team_box['y2']
+                team = team_box['team']
+                
+                # 調整座標到輸出尺寸
+                if original_frame is not None:
+                    x1 = int(x1 * output_width / original_frame.shape[1])
+                    y1 = int(y1 * output_height / original_frame.shape[0])
+                    x2 = int(x2 * output_width / original_frame.shape[1])
+                    y2 = int(y2 * output_height / original_frame.shape[0])
+                
+                color = (255, 0, 0) if team == '3-s' else (0, 0, 255)
+                
+                cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv2.putText(processed_frame, team, (int(x1), int(y1) - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # 繪製籃框
         if hoop_data and hoop_data['center']:
@@ -675,20 +813,20 @@ class BasketballTracker:
             args=(self.stage1_to_stage2_q, self.stage2_to_stage3_q)
         )
 
-        # 準備 Stage3 需要的分析器和配置
-        stage3_config = {
+        self.stage3_config = {  # ===== 改為 self.stage3_config =====
             'output_width': 640,
             'output_height': 480,
             'class_names': ['3-s', 'ball', 'biv', 'hoop', 'number', 'player'],
             'team_mapping': {0: '3-s', 2: 'biv'},
             'court_image_path': None,  # 會在 set_court_reference 時更新
-            'image_points': None
+            'image_points': None,
+            'data_folder': data_folder
         }
 
         self.stage3_process = self.ctx.Process(
             target=pipeline_stage3_worker,
             args=(self.stage2_to_stage3_q, self.stage3_output_q, 
-                  self.frame_completion_events, stage3_config)
+                  self.frame_completion_events, self.stage3_config)
         )
 
         self.stage1_process.start()
@@ -701,20 +839,17 @@ class BasketballTracker:
         print(paddle.is_compiled_with_cuda())  # 如果返回 False，表示 Paddle 未啟用 GPU 支援
         print(paddle.device.get_device())  # 檢查當前使用的設備
 
-        self.ocr = PaddleOCR(lang='en',
-                             rec_model_dir="./path_to/en_PP-OCRv3_rec_infer",  # 英文識別模型（高精度）
-                             cls_model_dir="./path_to/ch_ppocr_mobile_v2.0_cls_infer",  # 若要啟用方向分類器
-                             use_angle_cls=False,
-                             use_gpu=True,
-                             show_log=False)
-        print(f"OCR模型載入完成")
+        # ===== 關鍵修改：移除主類別中的OCR初始化 =====
+        # 註解掉原本的OCR初始化，因為已移至Pipeline Stage2
+        # self.ocr = PaddleOCR(...)
+        # self.number_recognizer = NumberRecognizer(self.ocr)
+        print(f"OCR模型載入已移至Pipeline Stage2，使用NumberRecognizer邏輯")
 
         # 初始化資料管理器
         self.data_folder = data_folder
         self.data_manager = DataManager(data_folder)
 
         # 初始化各種分析器
-        self.number_recognizer = NumberRecognizer(self.ocr)
         self.scoring_analyzer = ScoringAnalyzer()
         self.coordinate_mapper = CoordinateMapper()
 
@@ -988,6 +1123,10 @@ class BasketballTracker:
 
     def set_court_reference(self, court_image_path):
         """設置球場參考圖和參考點"""
+        import cv2
+        import numpy as np
+        
+        # 更新主類別屬性
         self.court_image = cv2.imread(court_image_path)
         self.image_points = np.array([
             [497, 347],  # top_left
@@ -996,6 +1135,14 @@ class BasketballTracker:
             [853, 567]  # bottom_right
         ], dtype=np.float32)
         self.coordinate_mapper.set_reference(court_image_path, self.image_points)
+        
+        # ===== 新增：更新 Pipeline Stage3 配置 =====
+        if hasattr(self, 'stage3_config'):
+            self.stage3_config['court_image_path'] = court_image_path
+            self.stage3_config['image_points'] = self.image_points.tolist()  # 轉為 list 供多進程使用
+            print(f"[修正] 已更新 Pipeline Stage3 球場設定: {court_image_path}")
+        else:
+            print("[警告] stage3_config 不存在，無法更新球場設定")
 
     def update_display_options(self, player=True, ball=True, team=True, number=True, trajectory=True):
         """更新顯示選項"""
