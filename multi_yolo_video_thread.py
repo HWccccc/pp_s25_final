@@ -257,9 +257,11 @@ class YOLODetector:
         
         player_times = []
         court_times = []
+        actual_frame_times = []  # 實際每幀並行處理時間
         total_start = time.time()
         
         for i, frame in enumerate(frames):
+            frame_start = time.time()
             p_time = [0]
             c_time = [0]
             
@@ -282,20 +284,34 @@ class YOLODetector:
             t1.join()
             t2.join()
             
+            frame_end = time.time()
+            actual_frame_time = frame_end - frame_start
+            
             player_times.append(p_time[0])
             court_times.append(c_time[0])
+            actual_frame_times.append(actual_frame_time)
             
-            print(f"[多執行緒] Frame-{i}: 球員 {p_time[0]:.3f}s, 球場 {c_time[0]:.3f}s")
+            # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+            serial_time = p_time[0] + c_time[0]
+            potential_cost = serial_time - actual_frame_time
+            
+            print(f"[多執行緒] Frame-{i}: 球員 {p_time[0]:.3f}s, 球場 {c_time[0]:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
         
         total_time = time.time() - total_start
         avg_player_time = sum(player_times) / len(player_times) if player_times else 0
         avg_court_time = sum(court_times) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+        
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
         
         return {
             "total_time": total_time,
             "frames": len(frames),
             "avg_player_time": avg_player_time,
-            "avg_court_time": avg_court_time
+            "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost
         }
 
     def run_multiprocess(self, video_path, max_frames):
@@ -322,9 +338,11 @@ class YOLODetector:
 
         player_times = []
         court_times = []
+        actual_frame_times = []  # 實際每幀並行處理時間
         total_start = time.time()
 
         for i, frame in enumerate(frames):
+            frame_start = time.time()
             manager = mp.Manager()
             result_dict = manager.dict()
 
@@ -341,23 +359,37 @@ class YOLODetector:
             p_court.start()
             p_player.join()
             p_court.join()
+            
+            frame_end = time.time()
+            actual_frame_time = frame_end - frame_start
 
             pt = result_dict['player_times'][0]
             ct = result_dict['court_times'][0]
             player_times.append(pt)
             court_times.append(ct)
+            actual_frame_times.append(actual_frame_time)
 
-            print(f"[多進程] Frame-{i}: 球員 {pt:.3f}s, 球場 {ct:.3f}s")
+            # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+            serial_time = pt + ct
+            potential_cost = serial_time - actual_frame_time
+
+            print(f"[多進程] Frame-{i}: 球員 {pt:.3f}s, 球場 {ct:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
 
         total_time = time.time() - total_start
         avg_player_time = sum(player_times)/len(player_times) if player_times else 0
         avg_court_time = sum(court_times)/len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
 
         return {
             "total_time": total_time,
             "frames": len(frames),
             "avg_player_time": avg_player_time,
-            "avg_court_time": avg_court_time
+            "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost
         }
 
     def run_queue_multiprocess(self, video_path, max_frames):
@@ -399,8 +431,10 @@ class YOLODetector:
         start_total = time.time()
         player_times = {}
         court_times = {}
+        actual_frame_times = []  # 實際每幀並行處理時間
         
         for frame_idx, frame in enumerate(frames):
+            frame_start = time.time()
             player_task_queue.put((frame_idx, frame.copy()))
             court_task_queue.put((frame_idx, frame.copy()))
             
@@ -416,7 +450,17 @@ class YOLODetector:
                     else:
                         court_times[idx] = t
             
-            print(f"[佇列多進程] Frame-{frame_idx}: 球員 {frame_results.get('player', 0):.3f}s, 球場 {frame_results.get('court', 0):.3f}s")
+            frame_end = time.time()
+            actual_frame_time = frame_end - frame_start
+            actual_frame_times.append(actual_frame_time)
+            
+            # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+            pt = frame_results.get('player', 0)
+            ct = frame_results.get('court', 0)
+            serial_time = pt + ct
+            potential_cost = serial_time - actual_frame_time
+            
+            print(f"[佇列多進程] Frame-{frame_idx}: 球員 {pt:.3f}s, 球場 {ct:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
         
         player_task_queue.put(None)
         court_task_queue.put(None)
@@ -434,12 +478,18 @@ class YOLODetector:
         
         avg_player_time = sum(player_times.values()) / len(player_times) if player_times else 0
         avg_court_time = sum(court_times.values()) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+        
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
         
         return {
             "total_time": total_time,
             "frames": len(frames),
             "avg_player_time": avg_player_time,
-            "avg_court_time": avg_court_time
+            "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost
         }
         
     def run_improved_threading(self, video_path, max_frames):
@@ -466,6 +516,7 @@ class YOLODetector:
         
         player_times = []
         court_times = []
+        actual_frame_times = []  # 實際每幀並行處理時間
         
         thread_local = threading.local()
         
@@ -501,26 +552,41 @@ class YOLODetector:
         
         with ThreadPoolExecutor(max_workers=2) as executor:
             for i, frame in enumerate(frames):
+                frame_start = time.time()
                 player_future = executor.submit(process_player, frame, i)
                 court_future = executor.submit(process_court, frame, i)
                 
                 player_result, player_time = player_future.result()
                 court_result, court_time = court_future.result()
                 
+                frame_end = time.time()
+                actual_frame_time = frame_end - frame_start
+                
                 player_times.append(player_time)
                 court_times.append(court_time)
+                actual_frame_times.append(actual_frame_time)
                 
-                print(f"[ThreadPool] Frame-{i} 完成: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s")
+                # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+                serial_time = player_time + court_time
+                potential_cost = serial_time - actual_frame_time
+                
+                print(f"[ThreadPool] Frame-{i} 完成: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
         
         total_time = time.time() - total_start
         avg_player_time = sum(player_times) / len(player_times) if player_times else 0
         avg_court_time = sum(court_times) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+        
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
         
         return {
             "total_time": total_time,
             "frames": len(frames),
             "avg_player_time": avg_player_time,
-            "avg_court_time": avg_court_time
+            "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost
         }
         
     def run_mp_pool(self, video_path, max_frames):
@@ -575,9 +641,11 @@ class YOLODetector:
             measurement_start = time.time()
             player_times = []
             court_times = []
+            actual_frame_times = []  # 實際每幀並行處理時間
             
             # 正式處理所有幀
             for i, frame in enumerate(frames):
+                frame_start = time.time()
                 player_future = executor.submit(
                     player_pool_worker_frame_sync, 
                     (frame, i, self.player_model_path, self.device)
@@ -591,10 +659,18 @@ class YOLODetector:
                     player_result_type, player_idx, player_result, player_time = player_future.result()
                     court_result_type, court_idx, court_result, court_time = court_future.result()
                     
+                    frame_end = time.time()
+                    actual_frame_time = frame_end - frame_start
+                    
                     player_times.append(player_time)
                     court_times.append(court_time)
+                    actual_frame_times.append(actual_frame_time)
                     
-                    print(f"[多進程池] Frame-{i} 完成: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s")
+                    # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+                    serial_time = player_time + court_time
+                    potential_cost = serial_time - actual_frame_time
+                    
+                    print(f"[多進程池] Frame-{i} 完成: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
                     
                 except Exception as e:
                     print(f"處理Frame-{i}時發生錯誤: {e}")
@@ -603,6 +679,11 @@ class YOLODetector:
         total_time = time.time() - measurement_start
         avg_player_time = sum(player_times) / len(player_times) if player_times else 0
         avg_court_time = sum(court_times) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+        
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
         
         print(f"多進程池模式完成，測量耗時: {total_time:.3f} 秒，預熱耗時: {warmup_time:.3f} 秒")
         
@@ -611,6 +692,7 @@ class YOLODetector:
             "frames": len(frames),
             "avg_player_time": avg_player_time,
             "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost,
             "warmup_time": warmup_time
         }
 
@@ -849,6 +931,7 @@ class YOLODetectionApp:
                 avg_player_time = self.results.get("avg_player_time", 0)
                 avg_court_time = self.results.get("avg_court_time", 0)
                 warmup_time = self.results.get("warmup_time", 0)
+                avg_potential_cost = self.results.get("avg_potential_cost", 0)
                 
                 self._log_message(f"\n===== {self._get_mode_name(mode)} 執行結果 =====")
                 self._log_message(f"總處理時間: {total_time:.3f} 秒")
@@ -858,6 +941,10 @@ class YOLODetectionApp:
                 self._log_message(f"平均每幀耗時: {total_time/frames:.3f} 秒 (約 {frames/total_time:.2f} FPS)")
                 self._log_message(f"平均球員偵測耗時: {avg_player_time:.3f} 秒")
                 self._log_message(f"平均球場偵測耗時: {avg_court_time:.3f} 秒")
+                
+                # 顯示平均潛在花費 (僅非序列模式)
+                if mode != MODE_SERIAL and avg_potential_cost > 0:
+                    self._log_message(f"平均潛在花費 (並行節省時間): {avg_potential_cost:.3f} 秒")
                 
             self.root.after(0, lambda: self.status_var.set("已完成"))
 
