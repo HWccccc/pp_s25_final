@@ -4,6 +4,8 @@
         "algorithm": "c",
         "limits": "c",
         "utility": "c",
-        "immintrin.h": "c"
+        "immintrin.h": "c",
+        "stdlib.h": "c",
+        "stdio.h": "c"
     }
 }

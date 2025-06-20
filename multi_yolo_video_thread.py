@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import threading
 import multiprocessing as mp
 import time
@@ -8,8 +9,22 @@ from tkinter import filedialog, ttk, messagebox
 import cv2
 import torch
 from ultralytics import YOLO
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib
+from concurrent.futures import ThreadPoolExecutor
 
-# ===== 修改開始: 將多進程工作函式移至模組頂層，避免 pickle 非可序列化的 self =====
+# Set environment variable to avoid OpenMP conflicts
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# 設置matplotlib支持中文顯示
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'sans-serif']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# ===== 多進程工作函式 =====
 def player_process_worker(frames, result_dict, player_model_path, device):
     """球員偵測多進程工作函式"""
     model = YOLO(player_model_path).to(device)
@@ -26,7 +41,6 @@ def player_process_worker(frames, result_dict, player_model_path, device):
         print(f"[多進程] 球員偵測 Frame-{i} 完成，耗時: {inference_time:.3f} 秒")
     result_dict['player_results'] = results
     result_dict['player_times'] = times
-
 
 def court_process_worker(frames, result_dict, court_model_path, device):
     """球場偵測多進程工作函式"""
@@ -45,7 +59,7 @@ def court_process_worker(frames, result_dict, court_model_path, device):
     result_dict['court_results'] = results
     result_dict['court_times'] = times
 
-# ===== 新增頂層佇列工作函式，以避免 pickle 自身鎖 =====
+# ===== 佇列工作函式 =====
 def player_queue_worker(task_queue, result_queue, player_model_path, device):
     """球員偵測佇列工作函式"""
     print("[球員佇列工作進程] 啟動，載入模型中...")
@@ -54,7 +68,8 @@ def player_queue_worker(task_queue, result_queue, player_model_path, device):
         while True:
             task = task_queue.get()
             if task is None:
-                print("[球員佇列工作進程] 收到結束訊號，退出。"); break
+                print("[球員佇列工作進程] 收到結束訊號，退出。")
+                break
             idx, frame = task
             start = time.time()
             res = model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
@@ -70,20 +85,57 @@ def court_queue_worker(task_queue, result_queue, court_model_path, device):
         while True:
             task = task_queue.get()
             if task is None:
-                print("[球場佇列工作進程] 收到結束訊號，退出。"); break
+                print("[球場佇列工作進程] 收到結束訊號，退出。")
+                break
             idx, frame = task
             start = time.time()
             res = model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
             t = time.time() - start
             print(f"[球場佇列工作進程] Frame-{idx} 推理完成，耗時: {t:.3f} 秒")
             result_queue.put(('court', idx, res, t))
-# ===== 修改結束 =====
+
+# ===== 多進程池工作函式（支援模型快取）=====
+def player_pool_worker_frame_sync(args):
+    """球員偵測池工作函式 - 支援模型快取"""
+    frame, idx, model_path, device = args
+
+    # 檢查是否已在這個進程中載入過模型
+    if not hasattr(player_pool_worker_frame_sync, 'model'):
+        print(f"[進程 {os.getpid()}] 載入球員模型")
+        player_pool_worker_frame_sync.model = YOLO(model_path).to(device)
+
+    with torch.no_grad():
+        start = time.time()
+        result = player_pool_worker_frame_sync.model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+        inference_time = time.time() - start
+
+    print(f"[多進程池] 球員偵測 Frame-{idx} 完成，耗時: {inference_time:.3f} 秒")
+    return ('player', idx, result, inference_time)
+
+def court_pool_worker_frame_sync(args):
+    """球場偵測池工作函式 - 支援模型快取"""
+    frame, idx, model_path, device = args
+
+    # 檢查是否已在這個進程中載入過模型
+    if not hasattr(court_pool_worker_frame_sync, 'model'):
+        print(f"[進程 {os.getpid()}] 載入球場模型")
+        court_pool_worker_frame_sync.model = YOLO(model_path).to(device)
+
+    with torch.no_grad():
+        start = time.time()
+        result = court_pool_worker_frame_sync.model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+        inference_time = time.time() - start
+
+    print(f"[多進程池] 球場偵測 Frame-{idx} 完成，耗時: {inference_time:.3f} 秒")
+    return ('court', idx, result, inference_time)
 
 # 功能選擇宏定義
-MODE_SERIAL = 0       # 序列模式
-MODE_THREADING = 1    # 多執行緒模式
-MODE_MULTIPROCESS = 2 # 多進程模式
-MODE_QUEUE = 3        # 佇列多進程模式
+MODE_SERIAL = 0
+MODE_THREADING = 1
+MODE_MULTIPROCESS = 2
+MODE_QUEUE = 3
+MODE_IMPROVED_THREADING = 4
+MODE_MP_POOL = 5
 
 class YOLODetector:
     def __init__(self, player_model_path, court_model_path):
@@ -91,195 +143,139 @@ class YOLODetector:
         self.court_model_path = court_model_path
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         print(f"使用裝置: {self.device}")
-        
-        # 先預載入模型，排除初始載入時間的影響
+
         self.player_model = None
         self.court_model = None
         
     def load_models(self):
-        """預先載入兩個模型，以排除載入時間的影響"""
+        """預先載入兩個模型"""
         print("預先載入模型中...")
         start = time.time()
         self.player_model = YOLO(self.player_model_path).to(self.device)
         self.court_model = YOLO(self.court_model_path).to(self.device)
+
+        with torch.no_grad():
+            dummy_img = torch.zeros((1, 3, 640, 640), device=self.device)
+            self.player_model.predict(source=dummy_img)
+            self.court_model.predict(source=dummy_img)
+
         end = time.time()
         print(f"模型載入完成，耗時: {end - start:.3f} 秒")
     
+    def warmup_mp_pool_models(self):
+        """預熱多進程池模型"""
+        from concurrent.futures import ProcessPoolExecutor
+
+        print("[多進程池] 開始預熱模型...")
+        warmup_start = time.time()
+
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            player_warmup = executor.submit(
+                player_pool_worker_frame_sync,
+                (dummy_frame, -1, self.player_model_path, self.device)
+            )
+            court_warmup = executor.submit(
+                court_pool_worker_frame_sync,
+                (dummy_frame, -1, self.court_model_path, self.device)
+            )
+
+            player_warmup.result()
+            court_warmup.result()
+
+        warmup_time = time.time() - warmup_start
+        print(f"[多進程池] 預熱完成，耗時: {warmup_time:.3f} 秒")
+        return warmup_time
+
     def run_serial(self, video_path, max_frames):
-        """序列模式：單線程執行所有影格辨識"""
+        """序列模式"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"無法開啟影片: {video_path}")
             return
         
-        # 確保模型已載入
-        #if self.player_model is None or self.court_model is None:
-        self.load_models()
-        
-        # 只讀取第一幀
-        # ret, frame = cap.read()
-        # if not ret:
-        #     print("無法讀取影片第一幀。")
-        #     cap.release()
-        #     return
-        
-        # cap.release()
-        # 讀取多個不同的frame
-        frames = []
-        for i in range(max_frames):
-            ret, frame = cap.read()
-            if not ret:
-                print(f"影片只有 {i} 幀，重複最後一幀")
-                frames.append(frames[-1].copy() if frames else None)
-                break
-            frames.append(frame.copy())
-        cap.release()        
-        
+        if self.player_model is None or self.court_model is None:
+            self.load_models()
+            
         frame_count = 0
         player_times = []
         court_times = []
         
         start_total = time.time()
-        #while frame_count < max_frames:
-        for frame_count, frame in enumerate(frames):
-            # 執行球員推理
+        while frame_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
             with torch.no_grad():
                 start = time.time()
                 player_results = self.player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
                 player_end = time.time()
                 player_time = player_end - start
                 player_times.append(player_time)
-                
-                # 執行球場推理
+
                 court_results = self.court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
                 court_end = time.time()
                 court_time = court_end - player_end
                 court_times.append(court_time)
                 
-                print(f"[序列模式] Frame-{frame_count}:")
-                print(f"  球員偵測耗時: {player_time:.3f} 秒")
-                print(f"  球場偵測耗時: {court_time:.3f} 秒")
+                print(f"[序列模式] Frame-{frame_count}: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s")
                     
             frame_count += 1
             
         end_total = time.time()
         total_time = end_total - start_total
-        
-        # 計算包含第一筆的平均時間
         avg_player_time = sum(player_times) / len(player_times) if player_times else 0
         avg_court_time = sum(court_times) / len(court_times) if court_times else 0
         
-        # 計算排除第一筆的平均時間
-        avg_player_time_exclude_first = sum(player_times[1:]) / len(player_times[1:]) if len(player_times) > 1 else 0
-        avg_court_time_exclude_first = sum(court_times[1:]) / len(court_times[1:]) if len(court_times) > 1 else 0
-        
-        # 第一筆單獨時間
-        first_frame_player_time = player_times[0] if player_times else 0
-        first_frame_court_time = court_times[0] if court_times else 0
-        first_frame_total_time = first_frame_player_time + first_frame_court_time
-        
-        print(f"序列模式完成，總耗時: {total_time:.3f} 秒，平均每幀: {total_time/frame_count:.3f} 秒")
-        print(f"球員偵測平均耗時: {avg_player_time:.3f} 秒")
-        print(f"球場偵測平均耗時: {avg_court_time:.3f} 秒")
-        
+        cap.release()
         return {
             "total_time": total_time,
             "frames": frame_count,
             "avg_player_time": avg_player_time,
-            "avg_court_time": avg_court_time,
-            "avg_player_time_exclude_first": avg_player_time_exclude_first,
-            "avg_court_time_exclude_first": avg_court_time_exclude_first,
-            "first_frame_player_time": first_frame_player_time,
-            "first_frame_court_time": first_frame_court_time,
-            "first_frame_total_time": first_frame_total_time
+            "avg_court_time": avg_court_time
         }
-        
-    # ==== 執行緒任務函式 ====
-    def _player_detection_thread(self, frames, results, times):
-        """球員偵測執行緒工作函數"""
-        for i, frame in enumerate(frames):
-            with torch.no_grad():
-                start = time.time()
-                result = self.player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
-                end = time.time()
-                
-                inference_time = end - start
-                times[i] = inference_time
-                results[i] = result
-                print(f"[多執行緒] Frame-{i} 球員偵測完成，耗時: {inference_time:.3f} 秒")
-                
-    def _court_detection_thread(self, frames, results, times):
-        """球場偵測執行緒工作函數"""
-        for i, frame in enumerate(frames):
-            with torch.no_grad():
-                start = time.time()
-                result = self.court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
-                end = time.time()
-                
-                inference_time = end - start
-                times[i] = inference_time
-                results[i] = result
-                print(f"[多執行緒] Frame-{i} 球場偵測完成，耗時: {inference_time:.3f} 秒")
-                
+
     def run_threading(self, video_path, max_frames):
-        """多執行緒模式：一個執行緒處理球員偵測，一個處理球場偵測"""
-        # 讀取影片第一幀
+        """多執行緒模式"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"無法開啟影片: {video_path}")
             return
-            
-        # 確保模型已載入
+
         if self.player_model is None or self.court_model is None:
             self.load_models()
-        
-        # 讀取第一幀
-        # ret, first_frame = cap.read()
-        # if not ret:
-        #     print("無法讀取影片第一幀。")
-        #     cap.release()
-        #     return
-            
-        # cap.release()
-        
-        # # 將第一幀複製多次，模擬處理多幀
-        # frames = [first_frame.copy() for _ in range(max_frames)]
+
         frames = []
-        for i in range(max_frames):
+        frame_count = 0
+        while frame_count < max_frames:
             ret, frame = cap.read()
             if not ret:
-                print(f"影片只有 {i} 幀，重複最後一幀")
-                frames.append(frames[-1].copy() if frames else None)
                 break
             frames.append(frame.copy())
-        cap.release()   
-          
-        # 同一張 frame 並行兩個 thread，完成後才進下一張
-        player_results = []
-        court_results  = []
-        player_times   = []
-        court_times    = []
+            frame_count += 1
+        cap.release()
+        
+        player_times = []
+        court_times = []
+        actual_frame_times = []  # 實際每幀並行處理時間
         total_start = time.time()
         
         for i, frame in enumerate(frames):
+            frame_start = time.time()
             p_time = [0]
             c_time = [0]
-            p_res  = [None]
-            c_res  = [None]
             
             def _run_player():
-                start = time.time()
-                p_res[0] = self.player_model.track(
-                    source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml"
-                )
-                p_time[0] = time.time() - start
+                with torch.no_grad():
+                    start = time.time()
+                    self.player_model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+                    p_time[0] = time.time() - start
             
             def _run_court():
-                start = time.time()
-                c_res[0] = self.court_model.track(
-                    source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml"
-                )
-                c_time[0] = time.time() - start
+                with torch.no_grad():
+                    start = time.time()
+                    self.court_model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+                    c_time[0] = time.time() - start
             
             t1 = threading.Thread(target=_run_player)
             t2 = threading.Thread(target=_run_court)
@@ -288,84 +284,65 @@ class YOLODetector:
             t1.join()
             t2.join()
             
-            player_results.append(p_res[0])
-            court_results.append(c_res[0])
+            frame_end = time.time()
+            actual_frame_time = frame_end - frame_start
+
             player_times.append(p_time[0])
             court_times.append(c_time[0])
-            
-            print(f"[多執行緒] Frame-{i}: 球員 {p_time[0]:.3f}s, 球場 {c_time[0]:.3f}s")
+            actual_frame_times.append(actual_frame_time)
+
+            # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+            serial_time = p_time[0] + c_time[0]
+            potential_cost = serial_time - actual_frame_time
+
+            print(f"[多執行緒] Frame-{i}: 球員 {p_time[0]:.3f}s, 球場 {c_time[0]:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
         
         total_time = time.time() - total_start
-        
-        # 計算包含第一筆的平均時間
         avg_player_time = sum(player_times) / len(player_times) if player_times else 0
-        avg_court_time  = sum(court_times)  / len(court_times)  if court_times  else 0
+        avg_court_time = sum(court_times) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
         
-        # 計算排除第一筆的平均時間
-        avg_player_time_exclude_first = sum(player_times[1:]) / len(player_times[1:]) if len(player_times) > 1 else 0
-        avg_court_time_exclude_first = sum(court_times[1:]) / len(court_times[1:]) if len(court_times) > 1 else 0
-        
-        # 第一筆單獨時間
-        first_frame_player_time = player_times[0] if player_times else 0
-        first_frame_court_time = court_times[0] if court_times else 0
-        first_frame_total_time = max(first_frame_player_time, first_frame_court_time)
-        
-        print(f"多執行緒模式完成，總耗時: {total_time:.3f} 秒，平均每幀: {total_time/len(frames):.3f} 秒")
-        print(f"球員偵測平均耗時: {avg_player_time:.3f} 秒")
-        print(f"球場偵測平均耗時: {avg_court_time:.3f} 秒")
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
         
         return {
             "total_time": total_time,
             "frames": len(frames),
             "avg_player_time": avg_player_time,
             "avg_court_time": avg_court_time,
-            "avg_player_time_exclude_first": avg_player_time_exclude_first,
-            "avg_court_time_exclude_first": avg_court_time_exclude_first,
-            "first_frame_player_time": first_frame_player_time,
-            "first_frame_court_time": first_frame_court_time,
-            "first_frame_total_time": first_frame_total_time
+            "avg_potential_cost": avg_potential_cost
         }
 
-    # ==== 多進程模式 ====    
     def run_multiprocess(self, video_path, max_frames):
-        """多進程模式：對每張影格啟動兩個 process（player、court）並行，完成後才處理下一張"""
-        # 讀取影片第一幀
+        """多進程模式"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"無法開啟影片: {video_path}")
             return
 
-        # # 讀取第一幀
-        # ret, first_frame = cap.read()
-        # if not ret:
-        #     print("無法讀取影片第一幀。")
-        #     cap.release()
-        #     return
-            
-        # cap.release()
-
-        # # 將第一幀複製多次，模擬處理多幀
-        # frames = [first_frame.copy() for _ in range(max_frames)]
         frames = []
-        for i in range(max_frames):
+        count = 0
+        while count < max_frames:
             ret, frame = cap.read()
             if not ret:
-                print(f"影片只有 {i} 幀，重複最後一幀")
-                frames.append(frames[-1].copy() if frames else None)
                 break
             frames.append(frame.copy())
-        cap.release()     
-        # Windows/macOS 必要
+            count += 1
+        cap.release()
+
+        if not frames:
+            return
+
         if sys.platform in ['win32', 'darwin']:
             mp.set_start_method("spawn", force=True)
 
         player_times = []
-        court_times  = []
-        process_overhead_times = []
+        court_times = []
+        actual_frame_times = []  # 實際每幀並行處理時間
         total_start = time.time()
 
         for i, frame in enumerate(frames):
-            # 每張影格都用新的 Manager 與 dict
+            frame_start = time.time()
             manager = mp.Manager()
             result_dict = manager.dict()
 
@@ -378,75 +355,47 @@ class YOLODetector:
                 args=([frame], result_dict, self.court_model_path, self.device)
             )
 
-            # 啟動並等待
-            p_start = time.time()
             p_player.start()
             p_court.start()
             p_player.join()
             p_court.join()
-            p_end = time.time()
 
-            # 從 result_dict 取出 index 0 的時間
+            frame_end = time.time()
+            actual_frame_time = frame_end - frame_start
+
             pt = result_dict['player_times'][0]
             ct = result_dict['court_times'][0]
-            process_total_time = p_end - p_start
-            
             player_times.append(pt)
             court_times.append(ct)
-            process_overhead_times.append(process_total_time)
+            actual_frame_times.append(actual_frame_time)
 
-            print(f"[多進程] Frame-{i}: 球員 {pt:.3f}s, 球場 {ct:.3f}s, 含啟動/同步 {process_total_time:.3f}s")
+            # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+            serial_time = pt + ct
+            potential_cost = serial_time - actual_frame_time
+
+            print(f"[多進程] Frame-{i}: 球員 {pt:.3f}s, 球場 {ct:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
 
         total_time = time.time() - total_start
-        
-        # 計算包含第一筆的平均時間
         avg_player_time = sum(player_times)/len(player_times) if player_times else 0
-        avg_court_time  = sum(court_times) /len(court_times)  if court_times  else 0
-        avg_process_overhead = sum(process_overhead_times) / len(process_overhead_times) if process_overhead_times else 0
-        
-        # 計算排除第一筆的平均時間
-        avg_player_time_exclude_first = sum(player_times[1:]) / len(player_times[1:]) if len(player_times) > 1 else 0
-        avg_court_time_exclude_first = sum(court_times[1:]) / len(court_times[1:]) if len(court_times) > 1 else 0
-        
-        # 第一筆單獨時間
-        first_frame_player_time = player_times[0] if player_times else 0
-        first_frame_court_time = court_times[0] if court_times else 0
-        first_frame_total_time = process_overhead_times[0] if process_overhead_times else 0
-        
-        # 計算開銷相關指標
-        avg_pure_inference = max(avg_player_time, avg_court_time)
-        overhead_time = avg_process_overhead - avg_pure_inference
-        overhead_ratio = (overhead_time / avg_process_overhead * 100) if avg_process_overhead > 0 else 0
+        avg_court_time = sum(court_times)/len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
 
-        print(f"多進程模式完成，總耗時: {total_time:.3f} 秒，平均每幀: {total_time/len(frames):.3f} 秒")
-        print(f"球員偵測平均耗時: {avg_player_time:.3f} 秒")
-        print(f"球場偵測平均耗時: {avg_court_time:.3f} 秒")
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
 
         return {
             "total_time": total_time,
             "frames": len(frames),
             "avg_player_time": avg_player_time,
             "avg_court_time": avg_court_time,
-            "avg_player_time_exclude_first": avg_player_time_exclude_first,
-            "avg_court_time_exclude_first": avg_court_time_exclude_first,
-            "first_frame_player_time": first_frame_player_time,
-            "first_frame_court_time": first_frame_court_time,
-            "first_frame_total_time": first_frame_total_time,
-            "avg_process_overhead": avg_process_overhead,
-            "overhead_ratio": overhead_ratio
+            "avg_potential_cost": avg_potential_cost
         }
 
     def run_queue_multiprocess(self, video_path, max_frames):
-        """佇列多進程模式：使用任務佇列的生產者消費者模式，同步處理同一frame - 完整開銷測量版本"""
-        
-        # 1. 進程啟動時間測量
-        total_start_time = time.time()
-        process_start_time = time.time()
-        
-        # 確保使用spawn方式
+        """佇列多進程模式"""
         ctx = mp.get_context("spawn")
-        
-        # 建立佇列
+
         player_task_queue = ctx.Queue(maxsize=10)
         court_task_queue = ctx.Queue(maxsize=10)
         result_queue = ctx.Queue()
@@ -464,52 +413,31 @@ class YOLODetector:
         
         p_player.start()
         p_court.start()
-        
-        process_startup_time = time.time() - process_start_time
-        print(f"進程啟動時間: {process_startup_time:.3f} 秒")
-        
-        # 2. 讀取影片幀
-        file_read_start = time.time()
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            print(f"無法開啟影片: {video_path}")
             return
         
         frames = []
         for i in range(max_frames):
             ret, frame = cap.read()
             if not ret:
-                print(f"影片只有 {i} 幀，重複最後一幀")
-                frames.append(frames[-1].copy() if frames else None)
+                if frames:
+                    frames.append(frames[-1].copy())
                 break
             frames.append(frame.copy())
         cap.release()
         
-        file_read_time = time.time() - file_read_start
-        print(f"影片讀取時間: {file_read_time:.3f} 秒")
-        
-        # 3. 逐幀處理和詳細開銷測量
-        player_times = []
-        court_times = []
-        data_transfer_times = []
-        wait_times = []
-        frame_overhead_times = []
-        frame_total_times = []
-        
-        processing_start_time = time.time()
-        
+        start_total = time.time()
+        player_times = {}
+        court_times = {}
+        actual_frame_times = []  # 實際每幀並行處理時間
+
         for frame_idx, frame in enumerate(frames):
             frame_start = time.time()
-            
-            # 3.1 數據傳輸時間
-            data_transfer_start = time.time()
             player_task_queue.put((frame_idx, frame.copy()))
             court_task_queue.put((frame_idx, frame.copy()))
-            data_transfer_time = time.time() - data_transfer_start
-            data_transfer_times.append(data_transfer_time)
-            
-            # 3.2 等待結果時間
-            wait_start = time.time()
+
             frame_results = {}
             got_results = 0
             while got_results < 2:
@@ -517,154 +445,257 @@ class YOLODetector:
                 if idx == frame_idx:
                     frame_results[typ] = t
                     got_results += 1
-            wait_time = time.time() - wait_start
-            wait_times.append(wait_time)
-            
-            frame_total_time = time.time() - frame_start
-            frame_total_times.append(frame_total_time)
-            
-            # 3.3 計算各種時間
-            player_inference_time = frame_results['player']
-            court_inference_time = frame_results['court']
-            pure_inference_time = max(player_inference_time, court_inference_time)
-            frame_overhead = frame_total_time - pure_inference_time
-            frame_overhead_times.append(frame_overhead)
-            
-            player_times.append(player_inference_time)
-            court_times.append(court_inference_time)
-            
-            print(f"[佇列多進程] Frame-{frame_idx} 時間軸:")
-            print(f"  1. 數據傳輸: {data_transfer_time:.3f}s")
-            print(f"  2. 並行推理: max({player_inference_time:.3f}s球員, {court_inference_time:.3f}s球場) = {pure_inference_time:.3f}s")
-            print(f"  3. 等待同步: {wait_time:.3f}s")
-            print(f"  → 幀總時間: {frame_total_time:.3f}s")
-            print(f"  → 理論時間: {data_transfer_time + pure_inference_time:.3f}s")
-            print(f"  → 額外開銷: {frame_overhead:.3f}s ({frame_overhead/frame_total_time*100:.1f}%)")
-        
-        processing_time = time.time() - processing_start_time
-        
-        # 4. 進程清理時間
-        cleanup_start = time.time()
+                    if typ == 'player':
+                        player_times[idx] = t
+                    else:
+                        court_times[idx] = t
+
+            frame_end = time.time()
+            actual_frame_time = frame_end - frame_start
+            actual_frame_times.append(actual_frame_time)
+
+            # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+            pt = frame_results.get('player', 0)
+            ct = frame_results.get('court', 0)
+            serial_time = pt + ct
+            potential_cost = serial_time - actual_frame_time
+
+            print(f"[佇列多進程] Frame-{frame_idx}: 球員 {pt:.3f}s, 球場 {ct:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
+
         player_task_queue.put(None)
         court_task_queue.put(None)
-        
-        # 等待工作進程結束
+
         p_player.join(timeout=3)
         p_court.join(timeout=3)
-        
-        # 如果進程沒有正常結束，強制終止
+
         if p_player.is_alive():
             p_player.terminate()
         if p_court.is_alive():
             p_court.terminate()
+            
+        end_total = time.time()
+        total_time = end_total - start_total
         
-        cleanup_time = time.time() - cleanup_start
-        print(f"進程清理時間: {cleanup_time:.3f} 秒")
+        avg_player_time = sum(player_times.values()) / len(player_times) if player_times else 0
+        avg_court_time = sum(court_times.values()) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
         
-        total_time = time.time() - total_start_time
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
         
-        # 5. 計算各種統計數據
-        # 5.1 推理時間統計
-        avg_player_time = sum(player_times) / len(player_times) if player_times else 0
-        avg_court_time = sum(court_times) / len(court_times) if court_times else 0
-        avg_player_time_exclude_first = sum(player_times[1:]) / len(player_times[1:]) if len(player_times) > 1 else 0
-        avg_court_time_exclude_first = sum(court_times[1:]) / len(court_times[1:]) if len(court_times) > 1 else 0
-        
-        # 5.2 開銷時間統計
-        avg_data_transfer_time = sum(data_transfer_times) / len(data_transfer_times) if data_transfer_times else 0
-        avg_wait_time = sum(wait_times) / len(wait_times) if wait_times else 0
-        avg_frame_overhead = sum(frame_overhead_times) / len(frame_overhead_times) if frame_overhead_times else 0
-        avg_frame_total_time = sum(frame_total_times) / len(frame_total_times) if frame_total_times else 0
-        
-        # 5.3 第一筆時間
-        first_frame_player_time = player_times[0] if player_times else 0
-        first_frame_court_time = court_times[0] if court_times else 0
-        first_frame_total_time = frame_total_times[0] if frame_total_times else 0
-        first_frame_overhead = frame_overhead_times[0] if frame_overhead_times else 0
-        
-        # 5.4 總開銷分析
-        total_pure_inference_time = sum(max(player_times[i], court_times[i]) for i in range(len(player_times)))
-        total_overhead_time = total_time - total_pure_inference_time
-        total_data_transfer_time = sum(data_transfer_times)
-        total_wait_time = sum(wait_times)
-        
-        # 6. 詳細結果輸出
-        print(f"\n===== 佇列多進程模式 - 詳細開銷分析 =====")
-        print(f"總處理時間: {total_time:.3f} 秒")
-        print(f"處理總幀數: {max_frames} 幀")
-        
-        print(f"\n時間分解:")
-        print(f"  進程啟動時間: {process_startup_time:.3f} 秒 ({process_startup_time/total_time*100:.1f}%)")
-        print(f"  影片讀取時間: {file_read_time:.3f} 秒 ({file_read_time/total_time*100:.1f}%)")
-        print(f"  實際處理時間: {processing_time:.3f} 秒 ({processing_time/total_time*100:.1f}%)")
-        print(f"  進程清理時間: {cleanup_time:.3f} 秒 ({cleanup_time/total_time*100:.1f}%)")
-        
-        print(f"\n推理時間統計:")
-        print(f"  總純推理時間: {total_pure_inference_time:.3f} 秒")
-        print(f"  球員偵測平均: {avg_player_time:.3f} 秒")
-        print(f"  球場偵測平均: {avg_court_time:.3f} 秒")
-        
-        print(f"\n開銷時間統計:")
-        print(f"  總開銷時間: {total_overhead_time:.3f} 秒 ({total_overhead_time/total_time*100:.1f}%)")
-        print(f"  總數據傳輸時間: {total_data_transfer_time:.3f} 秒 ({total_data_transfer_time/total_time*100:.1f}%)")
-        print(f"  總等待同步時間: {total_wait_time:.3f} 秒 ({total_wait_time/total_time*100:.1f}%)")
-        print(f"  平均每幀開銷: {avg_frame_overhead:.3f} 秒")
-        print(f"  平均每幀開銷占比: {avg_frame_overhead/avg_frame_total_time*100:.1f}%")
-        
-        print(f"\n第一筆vs後續比較:")
-        if len(player_times) > 1:
-            print(f"  第一筆總開銷: {first_frame_overhead:.3f} 秒")
-            avg_overhead_exclude_first = sum(frame_overhead_times[1:]) / len(frame_overhead_times[1:]) if len(frame_overhead_times) > 1 else 0
-            print(f"  後續平均開銷: {avg_overhead_exclude_first:.3f} 秒")
-            if avg_overhead_exclude_first > 0:
-                overhead_ratio = first_frame_overhead / avg_overhead_exclude_first
-                print(f"  第一筆開銷倍數: {overhead_ratio:.2f}x")
-        
-        # 7. 返回完整結果
         return {
             "total_time": total_time,
-            "frames": max_frames,
-            
-            # 推理時間
+            "frames": len(frames),
             "avg_player_time": avg_player_time,
             "avg_court_time": avg_court_time,
-            "avg_player_time_exclude_first": avg_player_time_exclude_first,
-            "avg_court_time_exclude_first": avg_court_time_exclude_first,
-            "first_frame_player_time": first_frame_player_time,
-            "first_frame_court_time": first_frame_court_time,
-            "first_frame_total_time": first_frame_total_time,
-            "total_pure_inference_time": total_pure_inference_time,
-            
-            # 開銷分析
-            "process_startup_time": process_startup_time,
-            "file_read_time": file_read_time,
-            "processing_time": processing_time,
-            "cleanup_time": cleanup_time,
-            "total_overhead_time": total_overhead_time,
-            "total_data_transfer_time": total_data_transfer_time,
-            "total_wait_time": total_wait_time,
-            "avg_data_transfer_time": avg_data_transfer_time,
-            "avg_wait_time": avg_wait_time,
-            "avg_frame_overhead": avg_frame_overhead,
-            "avg_frame_total_time": avg_frame_total_time,
-            "first_frame_overhead": first_frame_overhead,
-            
-            # 百分比
-            "overhead_percentage": total_overhead_time/total_time*100,
-            "startup_percentage": process_startup_time/total_time*100,
-            "cleanup_percentage": cleanup_time/total_time*100,
-            "data_transfer_percentage": total_data_transfer_time/total_time*100,
-            "wait_time_percentage": total_wait_time/total_time*100,
-            
-            # 原有數據保持兼容性
-            "player_times": player_times,
-            "court_times": court_times,
-            "data_transfer_times": data_transfer_times,
-            "wait_times": wait_times,
-            "frame_overhead_times": frame_overhead_times,
-            "frame_total_times": frame_total_times
+            "avg_potential_cost": avg_potential_cost
         }
-        
+
+    def run_improved_threading(self, video_path, max_frames):
+        """改進執行緒池模式"""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return
+
+        if self.player_model is None or self.court_model is None:
+            self.load_models()
+
+        frames = []
+        frame_count = 0
+        while frame_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame.copy())
+            frame_count += 1
+        cap.release()
+
+        if not frames:
+            return
+
+        player_times = []
+        court_times = []
+        actual_frame_times = []  # 實際每幀並行處理時間
+
+        thread_local = threading.local()
+
+        def get_player_model():
+            if not hasattr(thread_local, 'player_model'):
+                thread_local.player_model = self.player_model
+            return thread_local.player_model
+
+        def get_court_model():
+            if not hasattr(thread_local, 'court_model'):
+                thread_local.court_model = self.court_model
+            return thread_local.court_model
+
+        def process_player(frame, frame_idx):
+            model = get_player_model()
+            with torch.no_grad():
+                start = time.time()
+                result = model.track(source=frame, conf=0.3, persist=True, tracker="bytetrack.yaml")
+                elapsed = time.time() - start
+                print(f"[ThreadPool] Frame-{frame_idx} 球員檢測完成，耗時: {elapsed:.3f} 秒")
+                return result, elapsed
+
+        def process_court(frame, frame_idx):
+            model = get_court_model()
+            with torch.no_grad():
+                start = time.time()
+                result = model.track(source=frame, conf=0.25, persist=True, tracker="bytetrack.yaml")
+                elapsed = time.time() - start
+                print(f"[ThreadPool] Frame-{frame_idx} 球場檢測完成，耗時: {elapsed:.3f} 秒")
+                return result, elapsed
+
+        total_start = time.time()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for i, frame in enumerate(frames):
+                frame_start = time.time()
+                player_future = executor.submit(process_player, frame, i)
+                court_future = executor.submit(process_court, frame, i)
+
+                player_result, player_time = player_future.result()
+                court_result, court_time = court_future.result()
+
+                frame_end = time.time()
+                actual_frame_time = frame_end - frame_start
+
+                player_times.append(player_time)
+                court_times.append(court_time)
+                actual_frame_times.append(actual_frame_time)
+
+                # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+                serial_time = player_time + court_time
+                potential_cost = serial_time - actual_frame_time
+
+                print(f"[ThreadPool] Frame-{i} 完成: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
+
+        total_time = time.time() - total_start
+        avg_player_time = sum(player_times) / len(player_times) if player_times else 0
+        avg_court_time = sum(court_times) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
+
+        return {
+            "total_time": total_time,
+            "frames": len(frames),
+            "avg_player_time": avg_player_time,
+            "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost
+        }
+
+    def run_mp_pool(self, video_path, max_frames):
+        """多進程池模式 - 含預熱機制（修正版）"""
+        from concurrent.futures import ProcessPoolExecutor
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return
+
+        frames = []
+        count = 0
+        while count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(frame.copy())
+            count += 1
+        cap.release()
+
+        if not frames:
+            return
+
+        print(f"[多進程池] 使用 2 個工作進程 (逐幀同步)")
+
+        # 🔥 關鍵修正：在同一個進程池中進行預熱和正式處理
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            # 預熱階段
+            print("[多進程池] 開始預熱模型...")
+            warmup_start = time.time()
+
+            dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+            # 預熱兩個worker
+            player_warmup = executor.submit(
+                player_pool_worker_frame_sync,
+                (dummy_frame, -1, self.player_model_path, self.device)
+            )
+            court_warmup = executor.submit(
+                court_pool_worker_frame_sync,
+                (dummy_frame, -1, self.court_model_path, self.device)
+            )
+
+            # 等待預熱完成
+            player_warmup.result()
+            court_warmup.result()
+
+            warmup_time = time.time() - warmup_start
+            print(f"[多進程池] 預熱完成，耗時: {warmup_time:.3f} 秒")
+
+            # 🎯 正式測量開始（在同一個進程池中）
+            measurement_start = time.time()
+            player_times = []
+            court_times = []
+            actual_frame_times = []  # 實際每幀並行處理時間
+
+            # 正式處理所有幀
+            for i, frame in enumerate(frames):
+                frame_start = time.time()
+                player_future = executor.submit(
+                    player_pool_worker_frame_sync,
+                    (frame, i, self.player_model_path, self.device)
+                )
+                court_future = executor.submit(
+                    court_pool_worker_frame_sync,
+                    (frame, i, self.court_model_path, self.device)
+                )
+
+                try:
+                    player_result_type, player_idx, player_result, player_time = player_future.result()
+                    court_result_type, court_idx, court_result, court_time = court_future.result()
+
+                    frame_end = time.time()
+                    actual_frame_time = frame_end - frame_start
+
+                    player_times.append(player_time)
+                    court_times.append(court_time)
+                    actual_frame_times.append(actual_frame_time)
+
+                    # 計算這一幀的潛在花費（序列模式耗時 - 並行模式耗時）
+                    serial_time = player_time + court_time
+                    potential_cost = serial_time - actual_frame_time
+
+                    print(f"[多進程池] Frame-{i} 完成: 球員 {player_time:.3f}s, 球場 {court_time:.3f}s, 實際 {actual_frame_time:.3f}s, 潛在花費 {potential_cost:.3f}s")
+
+                except Exception as e:
+                    print(f"處理Frame-{i}時發生錯誤: {e}")
+                    continue
+
+        total_time = time.time() - measurement_start
+        avg_player_time = sum(player_times) / len(player_times) if player_times else 0
+        avg_court_time = sum(court_times) / len(court_times) if court_times else 0
+        avg_actual_time = sum(actual_frame_times) / len(actual_frame_times) if actual_frame_times else 0
+
+        # 平均潛在花費 = 平均序列耗時 - 平均並行耗時
+        avg_serial_time = avg_player_time + avg_court_time
+        avg_potential_cost = avg_serial_time - avg_actual_time
+
+        print(f"多進程池模式完成，測量耗時: {total_time:.3f} 秒，預熱耗時: {warmup_time:.3f} 秒")
+
+        return {
+            "total_time": total_time,
+            "frames": len(frames),
+            "avg_player_time": avg_player_time,
+            "avg_court_time": avg_court_time,
+            "avg_potential_cost": avg_potential_cost,
+            "warmup_time": warmup_time
+        }
+
 class YOLODetectionApp:
     def __init__(self, root):
         self.root = root
@@ -672,18 +703,14 @@ class YOLODetectionApp:
         self.root.geometry("800x600")
         
         self.detector = None
-        self.video_path = ""
-        self.current_mode = MODE_SERIAL
         self.results = {}
         
         self._create_widgets()
-        
+
     def _create_widgets(self):
-        # 主框架
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 設定區域
+
         settings_frame = ttk.LabelFrame(main_frame, text="設定", padding=10)
         settings_frame.pack(fill=tk.X, pady=5)
         
@@ -716,7 +743,9 @@ class YOLODetectionApp:
         modes = [("序列模式", MODE_SERIAL), 
                  ("多執行緒模式", MODE_THREADING), 
                  ("多進程模式", MODE_MULTIPROCESS), 
-                 ("佇列多進程模式", MODE_QUEUE)]
+                 ("佇列多進程模式", MODE_QUEUE),
+                 ("改進執行緒池模式", MODE_IMPROVED_THREADING),
+                 ("多進程池模式", MODE_MP_POOL)]
                  
         mode_frame = ttk.Frame(settings_frame)
         mode_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
@@ -727,8 +756,8 @@ class YOLODetectionApp:
         # 按鈕區域
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=10)
-        
         ttk.Button(button_frame, text="預載入模型", command=self._preload_models).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="預熱多進程池", command=self._warmup_mp_pool).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="開始處理", command=self._start_detection).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="清除結果", command=self._clear_results).pack(side=tk.LEFT, padx=5)
         
@@ -771,7 +800,7 @@ class YOLODetectionApp:
             self.video_path_var.set(filename)
     
     def _preload_models(self):
-        """預載入模型，避免計時時包含載入時間"""
+        """預載入模型"""
         player_model_path = self.player_model_path_var.get()
         court_model_path = self.court_model_path_var.get()
         
@@ -789,8 +818,7 @@ class YOLODetectionApp:
         
         self.status_var.set("正在預載入模型...")
         self.root.update()
-        
-        # 初始化偵測器並預載入模型
+
         if self.detector is None:
             self.detector = YOLODetector(player_model_path, court_model_path)
         self.detector.load_models()
@@ -798,9 +826,40 @@ class YOLODetectionApp:
         self.status_var.set("模型已預載入")
         self._log_message("模型已預載入，現在可以開始測試了。")
     
+    def _warmup_mp_pool(self):
+        """預熱多進程池模型"""
+        player_model_path = self.player_model_path_var.get()
+        court_model_path = self.court_model_path_var.get()
+
+        if not player_model_path or not court_model_path:
+            messagebox.showwarning("警告", "請指定兩個模型路徑")
+            return
+
+        if not os.path.exists(player_model_path):
+            messagebox.showerror("錯誤", f"球員模型檔案不存在: {player_model_path}")
+            return
+
+        if not os.path.exists(court_model_path):
+            messagebox.showerror("錯誤", f"球場模型檔案不存在: {court_model_path}")
+            return
+
+        self.status_var.set("正在預熱多進程池...")
+        self.root.update()
+
+        if self.detector is None:
+            self.detector = YOLODetector(player_model_path, court_model_path)
+
+        try:
+            warmup_time = self.detector.warmup_mp_pool_models()
+            self.status_var.set("多進程池已預熱")
+            self._log_message(f"多進程池預熱完成，耗時: {warmup_time:.3f} 秒")
+        except Exception as e:
+            self.status_var.set("預熱失敗")
+            self._log_message(f"預熱失敗: {str(e)}")
+            messagebox.showerror("錯誤", f"預熱失敗:\n{str(e)}")
+
     def _start_detection(self):
         """開始偵測處理"""
-        # 檢查輸入
         video_path = self.video_path_var.get()
         if not video_path:
             messagebox.showwarning("警告", "請選擇影片檔案")
@@ -824,31 +883,24 @@ class YOLODetectionApp:
         if not os.path.exists(court_model_path):
             messagebox.showerror("錯誤", f"球場模型檔案不存在: {court_model_path}")
             return
-            
-        # 更新狀態
+
         self.status_var.set("處理中...")
         self.root.update()
-        
-        # 設置偵測器
+
         if self.detector is None:
             self.detector = YOLODetector(player_model_path, court_model_path)
-            # 先預載入模型
             self.detector.load_models()
-        
-        # 執行模式選擇
+
         mode = self.mode_var.get()
         max_frames = self.frames_var.get()
-        
-        # 開始非同步執行
+
         threading.Thread(target=self._run_detection, args=(mode, video_path, max_frames), daemon=True).start()
         
     def _run_detection(self, mode, video_path, max_frames):
         """執行選定的偵測模式"""
         try:
-            # 清除之前的結果
             self.results = {}
-            
-            # 根據選擇的模式執行不同方法
+
             self._log_message(f"開始執行，模式: {self._get_mode_name(mode)}, 影格數: {max_frames}")
             
             if mode == MODE_SERIAL:
@@ -863,14 +915,37 @@ class YOLODetectionApp:
             elif mode == MODE_QUEUE:
                 self._log_message("執行佇列多進程模式...")
                 self.results = self.detector.run_queue_multiprocess(video_path, max_frames)
+            elif mode == MODE_IMPROVED_THREADING:
+                self._log_message("執行改進的多執行緒模式...")
+                self.results = self.detector.run_improved_threading(video_path, max_frames)
+            elif mode == MODE_MP_POOL:
+                self._log_message("執行多進程池模式...")
+                self.results = self.detector.run_mp_pool(video_path, max_frames)
             else:
                 messagebox.showerror("錯誤", f"未知的執行模式: {mode}")
                 return
-                
-            # 顯示完成訊息
+
             if "total_time" in self.results:
-                self._display_results(mode)
-                
+                total_time = self.results["total_time"]
+                frames = self.results.get("frames", 0)
+                avg_player_time = self.results.get("avg_player_time", 0)
+                avg_court_time = self.results.get("avg_court_time", 0)
+                warmup_time = self.results.get("warmup_time", 0)
+                avg_potential_cost = self.results.get("avg_potential_cost", 0)
+
+                self._log_message(f"\n===== {self._get_mode_name(mode)} 執行結果 =====")
+                self._log_message(f"總處理時間: {total_time:.3f} 秒")
+                if warmup_time > 0:
+                    self._log_message(f"預熱時間: {warmup_time:.3f} 秒 (不計入測量)")
+                self._log_message(f"處理總幀數: {frames} 幀")
+                self._log_message(f"平均每幀耗時: {total_time/frames:.3f} 秒 (約 {frames/total_time:.2f} FPS)")
+                self._log_message(f"平均球員偵測耗時: {avg_player_time:.3f} 秒")
+                self._log_message(f"平均球場偵測耗時: {avg_court_time:.3f} 秒")
+
+                # 顯示平均潛在花費 (僅非序列模式)
+                if mode != MODE_SERIAL and avg_potential_cost > 0:
+                    self._log_message(f"平均潛在花費 (並行節省時間): {avg_potential_cost:.3f} 秒")
+
             self.root.after(0, lambda: self.status_var.set("已完成"))
 
         except Exception as e:
@@ -878,93 +953,6 @@ class YOLODetectionApp:
             import traceback
             self._log_message(traceback.format_exc())
             self.root.after(0, lambda: self.status_var.set("發生錯誤"))
-    
-    def _display_results(self, mode):
-        """顯示詳細的執行結果"""
-        total_time = self.results["total_time"]
-        frames = self.results.get("frames", 0)
-        avg_player_time = self.results.get("avg_player_time", 0)
-        avg_court_time = self.results.get("avg_court_time", 0)
-        avg_player_time_exclude_first = self.results.get("avg_player_time_exclude_first", 0)
-        avg_court_time_exclude_first = self.results.get("avg_court_time_exclude_first", 0)
-        first_frame_player_time = self.results.get("first_frame_player_time", 0)
-        first_frame_court_time = self.results.get("first_frame_court_time", 0)
-        first_frame_total_time = self.results.get("first_frame_total_time", 0)
-        
-        self._log_message(f"\n===== {self._get_mode_name(mode)} 執行結果 =====")
-        self._log_message(f"總處理時間: {total_time:.3f} 秒")
-        self._log_message(f"處理總幀數: {frames} 幀")
-        
-        # 第一筆時間記錄
-        self._log_message(f"\n第一筆時間記錄:")
-        self._log_message(f"  球員偵測: {first_frame_player_time:.6f} 秒")
-        self._log_message(f"  球場偵測: {first_frame_court_time:.6f} 秒")
-        
-        # 包含第一筆的平均時間
-        self._log_message(f"\n包含第一筆的平均時間:")
-        self._log_message(f"  球員偵測平均: {avg_player_time:.6f} 秒")
-        self._log_message(f"  球場偵測平均: {avg_court_time:.6f} 秒")
-        
-        # 排除第一筆的平均時間
-        if frames > 1:
-            self._log_message(f"\n排除第一筆的平均時間:")
-            self._log_message(f"  球員偵測平均: {avg_player_time_exclude_first:.6f} 秒")
-            self._log_message(f"  球場偵測平均: {avg_court_time_exclude_first:.6f} 秒")
-            
-            # 第一筆影響倍數
-            if avg_player_time_exclude_first > 0:
-                player_ratio = first_frame_player_time / avg_player_time_exclude_first
-                self._log_message(f"  第一筆球員偵測倍數: {player_ratio:.2f}x")
-            if avg_court_time_exclude_first > 0:
-                court_ratio = first_frame_court_time / avg_court_time_exclude_first
-                self._log_message(f"  第一筆球場偵測倍數: {court_ratio:.2f}x")
-        
-        # Mode 2 特殊的開銷分析
-        if mode == MODE_MULTIPROCESS and "avg_process_overhead" in self.results:
-            avg_process_overhead = self.results["avg_process_overhead"]
-            overhead_ratio = self.results["overhead_ratio"]
-            self._log_message(f"\n多進程開銷分析:")
-            self._log_message(f"  平均進程總開銷時間: {avg_process_overhead:.6f} 秒")
-            self._log_message(f"  開銷占比: {overhead_ratio:.1f}%")
-        
-        # FPS 計算
-        self._log_message(f"\n===== FPS 分析 =====")
-        
-        # 包含第一筆的FPS
-        if mode == MODE_SERIAL:
-            theoretical_fps_with_first = 1 / (avg_player_time + avg_court_time) if (avg_player_time + avg_court_time) > 0 else 0
-            self._log_message(f"理論最大 FPS (序列，包含第一筆): {theoretical_fps_with_first:.2f}")
-        else:
-            theoretical_fps_with_first = 1 / max(avg_player_time, avg_court_time) if max(avg_player_time, avg_court_time) > 0 else 0
-            self._log_message(f"理論最大 FPS (並行，包含第一筆): {theoretical_fps_with_first:.2f}")
-        
-        # 排除第一筆的FPS
-        if frames > 1:
-            if mode == MODE_SERIAL:
-                theoretical_fps_exclude_first = 1 / (avg_player_time_exclude_first + avg_court_time_exclude_first) if (avg_player_time_exclude_first + avg_court_time_exclude_first) > 0 else 0
-                self._log_message(f"理論最大 FPS (序列，排除第一筆): {theoretical_fps_exclude_first:.2f}")
-            else:
-                theoretical_fps_exclude_first = 1 / max(avg_player_time_exclude_first, avg_court_time_exclude_first) if max(avg_player_time_exclude_first, avg_court_time_exclude_first) > 0 else 0
-                self._log_message(f"理論最大 FPS (並行，排除第一筆): {theoretical_fps_exclude_first:.2f}")
-        
-        # 實際處理頻率
-        processing_rate_with_first = frames / total_time if total_time > 0 else 0
-        self._log_message(f"實際處理頻率 (包含第一筆): {processing_rate_with_first:.2f} 次/秒")
-        
-        if frames > 1:
-            exclude_first_total_time = total_time - first_frame_total_time
-            processing_rate_exclude_first = (frames - 1) / exclude_first_total_time if exclude_first_total_time > 0 else 0
-            self._log_message(f"實際處理頻率 (排除第一筆): {processing_rate_exclude_first:.2f} 次/秒")
-        
-        # 計算並行效率
-        if mode != MODE_SERIAL and frames > 1:
-            serial_time = avg_player_time_exclude_first + avg_court_time_exclude_first
-            parallel_time = max(avg_player_time_exclude_first, avg_court_time_exclude_first)
-            if parallel_time > 0:
-                speedup = serial_time / parallel_time
-                efficiency = speedup / 2.0 * 100  # 兩個模型的並行效率
-                self._log_message(f"並行加速比 (排除第一筆): {speedup:.2f}x")
-                self._log_message(f"並行效率 (排除第一筆): {efficiency:.1f}%")
             
     def _get_mode_name(self, mode):
         """根據模式ID獲取模式名稱"""
@@ -972,7 +960,9 @@ class YOLODetectionApp:
             MODE_SERIAL: "序列模式",
             MODE_THREADING: "多執行緒模式",
             MODE_MULTIPROCESS: "多進程模式",
-            MODE_QUEUE: "佇列多進程模式"
+            MODE_QUEUE: "佇列多進程模式",
+            MODE_IMPROVED_THREADING: "改進的多執行緒模式",
+            MODE_MP_POOL: "多進程池模式"
         }
         return mode_names.get(mode, "未知模式")
     
@@ -982,7 +972,7 @@ class YOLODetectionApp:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
-        print(message)  # 同時輸出到控制台
+        print(message)
         
     def _clear_results(self):
         """清除結果顯示"""
@@ -993,30 +983,28 @@ class YOLODetectionApp:
         self.status_var.set("就緒")
 
 if __name__ == "__main__":
-    # 設定多處理程序啟動方法
     if sys.platform in ['win32', 'darwin']:
         try:
             mp.set_start_method("spawn", force=True)
         except RuntimeError:
-            # 若已經設定過，忽略錯誤
             pass
     
-    # 解析命令行參數，允許直接從命令行啟動特定模式
-    import argparse
-    parser = argparse.ArgumentParser(description='YOLO四種檢測機制')
-    parser.add_argument('--mode', type=int, choices=[0, 1, 2, 3], help='偵測模式: 0=序列, 1=多執行緒, 2=多進程, 3=佇列多進程')
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'sans-serif']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    parser = argparse.ArgumentParser(description='YOLO六種檢測機制')
+    parser.add_argument('--mode', type=int, choices=[0, 1, 2, 3, 4, 5],
+                      help='偵測模式: 0=序列, 1=多執行緒, 2=多進程, 3=佇列多進程, 4=改進執行緒池, 5=多進程池')
     parser.add_argument('--frames', type=int, default=10, help='要處理的影格數')
     parser.add_argument('--video', type=str, help='影片檔案路徑')
     parser.add_argument('--player_model', type=str, default='best_demo_v2.pt', help='球員模型路徑')
     parser.add_argument('--court_model', type=str, default='Court_best.pt', help='球場模型路徑')
     
     args = parser.parse_args()
-    
-    # 啟動GUI
+
     root = tk.Tk()
     app = YOLODetectionApp(root)
-    
-    # 如果有命令行參數，自動填入GUI並啟動
+
     if args.video and os.path.exists(args.video):
         app.video_path_var.set(args.video)
         
@@ -1031,9 +1019,8 @@ if __name__ == "__main__":
         
     if args.mode is not None:
         app.mode_var.set(args.mode)
-        # 如果所有需要的參數都有，自動啟動
         if args.video and os.path.exists(args.video):
-            root.after(1000, app._preload_models)  # 先預載入模型
-            root.after(2000, app._start_detection)  # 然後開始偵測
+            root.after(1000, app._preload_models)
+            root.after(2000, app._start_detection)
     
     root.mainloop()

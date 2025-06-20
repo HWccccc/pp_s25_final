@@ -1,12 +1,16 @@
 import os
 import sys
+# 解決 OpenMP 多重初始化錯誤
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                             QWidget, QPushButton, QCheckBox, QLabel, QTabWidget,
                             QTextEdit, QFileDialog, QGroupBox, QGridLayout,
                             QScrollArea, QSizePolicy, QFrame)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QMetaObject, Q_ARG, QBasicTimer
 from PyQt6.QtGui import QPixmap, QImage, QFont
-
+from PyQt6.QtWidgets import QMessageBox
+import traceback
 import cv2
 import numpy as np
 import pandas as pd
@@ -24,29 +28,62 @@ class VideoThread(QThread):
         self.is_running = False
         self.is_paused = False
         self._mutex = QMutex()
+        # Explicit flag for thread termination to avoid QBasicTimer errors
+        self._terminate_requested = False
 
     def run(self):
         self.is_running = True
         while self.is_running:
             if not self.is_paused:
-                processed_frame, court_frame, detected_players = self.tracker.next_frame()
-                if processed_frame is None:
-                    self.change_pixmap_signal.emit(None, None, None, [])
+                try:
+                    processed_frame, court_frame, detected_players = self.tracker.next_frame()
+                    if processed_frame is None:
+                        self.change_pixmap_signal.emit(None, None, None, [])
+                        break
+                    display_frame = self.tracker.get_current_frame()
+                    scores = self.tracker.get_current_scores()
+                    self.change_pixmap_signal.emit(display_frame, processed_frame, court_frame, detected_players)
+                    self.status_update_signal.emit(scores)
+                except Exception as e:
+                    print(f"Error in video thread processing: {e}")
                     break
-                display_frame = self.tracker.get_current_frame()
-                scores = self.tracker.get_current_scores()
-                self.change_pixmap_signal.emit(display_frame, processed_frame, court_frame, detected_players)
-                self.status_update_signal.emit(scores)
             self.msleep(30)
+            
+            # Check for termination request
+            self._mutex.lock()
+            if self._terminate_requested:
+                self.is_running = False
+            self._mutex.unlock()
 
     def stop(self):
+        # Thread-safe termination request
+        self._mutex.lock()
+        self._terminate_requested = True
         self.is_running = False
-        self.wait()
-    def pause(self): self.is_paused = True
-    def play(self): self.is_paused = False
+        self._mutex.unlock()
+        
+        # Wait with timeout to ensure thread stops
+        if not self.wait(3000):  # Wait for 3 seconds
+            print("Thread did not terminate properly, forcing termination")
+            self.terminate()
+            self.wait()
+            
+    def pause(self): 
+        self._mutex.lock()
+        self.is_paused = True
+        self._mutex.unlock()
+        
+    def play(self): 
+        self._mutex.lock()
+        self.is_paused = False
+        self._mutex.unlock()
+        
     def toggle_play_pause(self):
+        self._mutex.lock()
         self.is_paused = not self.is_paused
-        return "暫停" if not self.is_paused else "播放"
+        result = "暫停" if not self.is_paused else "播放"
+        self._mutex.unlock()
+        return result
 
 class PyQtInterface(QMainWindow):
     def __init__(self, tracker):
@@ -580,14 +617,13 @@ class PyQtInterface(QMainWindow):
             for e in hist:
                 html += "<tr>" + "".join(f"<td align='center'>{e[col]}</td>" for col in
                     ['Team','Pic','Player','Number','PTS','REB','AST','STL','BLK',
-                     'FGM','FGA','FG%','3PM','3PA','3PT%','4PM','4PA','4PT%']
-                ) + "</tr>"
+                     'FGM','FGA','FG%','3PM','3PA','3PT%','4PM','4PA','4PT%']                ) + "</tr>"
             html += "</table>"
-
+            
         self.player_history_status_content.setHtml(html)
         if new_msgs:
             self.detection_message_content.setText("\n".join(new_msgs))
-
+            
     def show_performance_report(self):
         if not hasattr(self, 'tracker'): return
         self.tracker.print_performance_report()
@@ -606,15 +642,24 @@ class PyQtInterface(QMainWindow):
                 report += f"  Maximum: {stats.get(f'{step}_max', 0) * 1000:.2f} ms\n"
                 report += f"  Minimum: {stats.get(f'{step}_min', 0) * 1000:.2f} ms\n"
         self.performance_textbox_content.setText(report)
-
+        
     def closeEvent(self, event):
-        if self.video_thread is not None: self.video_thread.stop()
+        # Safely stop the video thread if it exists
+        if hasattr(self, 'video_thread') and self.video_thread is not None:
+            try:
+                self.video_thread.stop()
+                print("Video thread stopped successfully")
+            except Exception as e:
+                print(f"Error stopping video thread: {e}")
         event.accept()
 
 def main():
     data_folder = 'big3_data'
     if not os.path.exists(data_folder): os.makedirs(data_folder, exist_ok=True)
     try:
+        # Set environment variable to avoid OpenMP conflicts again just to be sure
+        os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        
         app = QApplication(sys.argv)
         app.setStyleSheet("""
             QWidget { color: #e0e0e0; background-color: #1e1e1e; }
@@ -651,14 +696,29 @@ def main():
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
             QLineEdit { padding: 2px; border: 1px solid #3c3c3c; border-radius: 3px; background: #2d2d2d;}
         """)
-        tracker = BasketballTracker(player_model_path='best_demo_v2.pt', court_model_path='Court_best.pt', data_folder=data_folder)
-        tracker.set_court_reference('court_pic.jpg')
+        
+        # Load the tracker with error handling
+        try:
+            tracker = BasketballTracker(player_model_path='best_demo_v2.pt', court_model_path='Court_best.pt', data_folder=data_folder)
+            tracker.set_court_reference('court_pic.jpg')
+        except Exception as tracker_error:
+            print(f"Error initializing basketball tracker: {tracker_error}")
+            
+            traceback.print_exc()
+            # Show error message box to the user
+            error_box = QMessageBox()
+            error_box.setIcon(QMessageBox.Icon.Critical)
+            error_box.setText("Error initializing basketball tracker")
+            error_box.setInformativeText(str(tracker_error))
+            error_box.setWindowTitle("Initialization Error")
+            error_box.exec()
+            sys.exit(1)
+            
         interface = PyQtInterface(tracker)
         interface.show()
         sys.exit(app.exec())
     except Exception as e:
         print(f"程序運行時發生錯誤: {e}")
-        import traceback
         traceback.print_exc()
 
 if __name__ == "__main__":

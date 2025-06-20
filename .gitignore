@@ -172,3 +172,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# output
+output_frames/
+path_to/
+output_video.mp4
+certificate.pem
