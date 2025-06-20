@@ -130,6 +130,9 @@ viztracer tests\multi_yolo_video_thread.py
 5. 選擇執行模式
 6. 點擊「開始處理」
 
+## 多執行緒效能測試UI
+![多執行緒效能測試UI圖](./readme_image/multi_yolo_video_thread.png)
+
 ### 2. 序列 vs Pipeline 處理比較
 
 ```bash
@@ -137,10 +140,16 @@ viztracer tests\multi_yolo_video_thread.py
 python tests\sequence.py
 viztracer tests\sequence.py
 
+## 序列處理
+![序列處理圖](./readme_image/sequence.png)
+
 # 測試 Pipeline 處理
 python tests\pipeline.py
 viztracer tests\pipeline.py
 ```
+
+## Pipeline 處理
+![Pipeline 處理圖](./readme_image/pipeline.png)
 
 ### 3. 座標計算平行化測試
 
@@ -162,6 +171,9 @@ python tests\coordinate_parallel_test.py
 5. 點擊「Start Test」進行手動測試
 6. 或點擊「Start Auto Test」進行自動化測試
 
+## 座標計算平行化測試UI
+![座標計算平行化測試UI圖](./readme_image/coordinate_parallel_test.png)
+
 ### 4. CUDA 環境檢測
 
 ```bash
@@ -178,14 +190,14 @@ python tests\test_cuda.py
 pip install viztracer
 
 # 分析序列處理
-viztracer --output_file sequence_trace.json -- python tests\sequence.py
+viztracer --output_file sequence_trace.json tests\sequence.py
 
 # 分析 Pipeline 處理  
-viztracer --output_file pipeline_trace.json -- python tests\pipeline.py
+viztracer --output_file pipeline_trace.json tests\pipeline.py
 
 # 開啟分析結果
-vizviewer sequence_trace.json
-vizviewer pipeline_trace.json
+vizviewer path_to\sequence_trace.json
+vizviewer path_to\pipeline_trace.json
 ```
 
 ## 常見問題
