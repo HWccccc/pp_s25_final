@@ -780,6 +780,25 @@ def pipeline_stage3_worker(input_q, output_q, frame_completion_events, config):
             output_q.put(None)
             break
         
+                # 檢查是否為配置更新消息
+        if isinstance(task, tuple) and task[0] == 'CONFIG_UPDATE':
+            updated_config = task[1]
+            print(f"[Pipeline階段3] 收到配置更新: {updated_config}")
+            
+            # 更新本地的配置和相關變量
+            config.update(updated_config)
+            
+            if config.get('court_image_path'):
+                court_image = cv2.imread(config['court_image_path'])
+                image_points_list = config.get('image_points')
+                if image_points_list is not None:
+                    image_points = np.array(image_points_list, dtype=np.float32)
+                    coordinate_mapper.set_reference(config['court_image_path'], image_points)
+                    print(f"[Pipeline階段3] 成功載入球場圖片: {config['court_image_path']}")
+                else:
+                    print(f"[Pipeline階段3] 警告：配置中未提供 image_points")
+            continue # 處理完配置後，繼續等待下一條消息
+        
         frame_id, stage2_results = task
         frame_count = frame_id  # 更新幀計數
         
@@ -1410,6 +1429,16 @@ class BasketballTracker:
             [853, 567]  # bottom_right
         ], dtype=np.float32)
         self.coordinate_mapper.set_reference(court_image_path, self.image_points)
+            # 建立一個新的配置字典，準備發送給 worker
+        new_config = {
+            'court_image_path': court_image_path,
+            'image_points': self.image_points.tolist()
+        }
+        
+        # 通過隊列將配置更新消息發送給 stage3 worker
+        # 我們將消息包裝在一個元組中，用一個特殊的標記 'CONFIG_UPDATE' 來區分
+        self.stage2_to_stage3_q.put(('CONFIG_UPDATE', new_config))
+        print(f"[主進程] 已發送球場配置更新指令到 Pipeline Stage 3")
         
         # ===== 新增：更新 Pipeline Stage3 配置 =====
         if hasattr(self, 'stage3_config'):
