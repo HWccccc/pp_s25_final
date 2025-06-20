@@ -139,10 +139,11 @@ viztracer tests\multi_yolo_video_thread.py
 # 測試序列處理
 python tests\sequence.py
 viztracer tests\sequence.py
-
+```
 ## 序列處理
 ![序列處理圖](./readme_image/sequence.png)
 
+```bash
 # 測試 Pipeline 處理
 python tests\pipeline.py
 viztracer tests\pipeline.py
