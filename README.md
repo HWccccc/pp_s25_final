@@ -172,7 +172,7 @@ python tests\coordinate_parallel_test.py
 6. 或點擊「Start Auto Test」進行自動化測試
 
 ## 座標計算平行化測試UI
-![座標計算平行化測試UI圖](./readme_image/coordinate_parallel_test.png)
+![座標計算平行化測試UI圖](./readme_image/coordinate.png)
 
 ### 4. CUDA 環境檢測
 
